@@ -112,9 +112,6 @@ Dependents via CSI:
   - `spec.storageClassName == <name of StorageClass which references the CephBlockPool>`
   - NOTE: dependents should continue to be ignored if `spec.cleanupPolicy.allowUninstallWithVolumes == true`
 
-Dependents via FlexVolume:
-- Unnecessary because Rook plans to deprecate FlexVolume support for v1.7
-
 #### `CephFilesystem`
 Dependents which can consume this provider's pools:
 - CephNFSes in the same namespace that have `spec.pool == <a provider pool>`
@@ -132,9 +129,6 @@ Dependents via CSI:
   - OR
   - `spec.storageClassName == <name of StorageClass which references the CephBlockPool>`
   - NOTE: dependents should continue to be ignored if `spec.cleanupPolicy.allowUninstallWithVolumes == true`
-
-Dependents via FlexVolume:
-- Unnecessary because Rook plans to deprecate FlexVolume support for v1.7
 
 #### `CephObjectStore`
 Dependents which can consume this provider's pools:
@@ -200,7 +194,7 @@ Reported statuses will be modified as follows:
 1. Object's status.phase should be changed to "Deleting" as soon as a deletion timestamp is detected
    and never changed
 1. A status.condition should be added if the operator is blocking deletion:
-   - Type: "BlockingDeletion"
+   - Type: "DeletionIsBlocked"
    - Status: "True"
    - Reason: "ObjectHasDependents"
    - Message: "object deletion is blocked because it has dependents:" followed by a full list of
@@ -210,7 +204,7 @@ Reported statuses will be modified as follows:
 **Event:**
 Reported events will have the following content:
 - Type: "Warning"
-- Reason: "ObjectHasDependents"
+- Reason: "ReconcileFailed"
 - Message: "object deletion is blocked because it has dependents:" followed by a full list of which
   dependents exist of which Kubernetes Object Kinds (e.g., CephBlockPools or PersistentVolumes) or
   of which Ceph kinds (e.g., pools or buckets).
@@ -297,9 +291,10 @@ easy to tackle these changes in stages so that changes can be more easily implem
 
 Stages by priority:
 1. Block deletion of a CephCluster when there are other Rook-Ceph resources in the same namespace
-1. Block deletion of a CephBlockPool, CephFilesystem, CephObjectStore, or CephObjectZone when a CephNFS uses one of its pools.
 1. Block deletion of a CephObjectStore when there is a user bucket present in the store.
    - This already has an implementation, but it blocks for unrelated OBs
+1. Block deletion of a CephBlockPool, CephFilesystem, CephObjectStore, or CephObjectZone when a
+   CephNFS uses one of its pools.
 1. Block deletion of a CephBlockPool or CephFilesystem when there is a PersistentVolume reliant on it.
 1. Block deletion of a CephObjectStore when there is a CephObjectStoreUser reliant on it.
 1. Block deletion of a CephRBDMirror if a CephBlockPool has mirroring enabled, AND

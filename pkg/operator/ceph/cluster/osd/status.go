@@ -25,7 +25,6 @@ import (
 
 	"github.com/pkg/errors"
 	"github.com/rook/rook/pkg/operator/ceph/config"
-	"github.com/rook/rook/pkg/operator/ceph/controller"
 	"github.com/rook/rook/pkg/operator/k8sutil"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -99,7 +98,7 @@ func (e *provisionErrors) asMessages() string {
 
 // return name of status ConfigMap
 func (c *Cluster) updateOSDStatus(node string, status OrchestrationStatus) string {
-	return UpdateNodeStatus(c.kv, node, status)
+	return UpdateNodeOrPVCStatus(c.clusterInfo.Context, c.kv, node, status)
 }
 
 func statusConfigMapLabels(node string) map[string]string {
@@ -110,22 +109,23 @@ func statusConfigMapLabels(node string) map[string]string {
 	}
 }
 
-// UpdateNodeStatus updates the status ConfigMap for the OSD on the given node. It returns the name
+// UpdateNodeOrPVCStatus updates the status ConfigMap for the OSD on the given node or PVC. It returns the name
 // the ConfigMap used.
-func UpdateNodeStatus(kv *k8sutil.ConfigMapKVStore, node string, status OrchestrationStatus) string {
-	labels := statusConfigMapLabels(node)
+func UpdateNodeOrPVCStatus(ctx context.Context, kv *k8sutil.ConfigMapKVStore, nodeOrPVC string, status OrchestrationStatus) string {
+	labels := statusConfigMapLabels(nodeOrPVC)
 
 	// update the status map with the given status now
 	s, _ := json.Marshal(status)
-	cmName := statusConfigMapName(node)
+	cmName := statusConfigMapName(nodeOrPVC)
 	if err := kv.SetValueWithLabels(
+		ctx,
 		cmName,
 		orchestrationStatusKey,
 		string(s),
 		labels,
 	); err != nil {
 		// log the error, but allow the orchestration to continue even if the status update failed
-		logger.Errorf("failed to set node %q status to %q for osd orchestration. %s", node, status.Status, status.Message)
+		logger.Errorf("failed to set node or PVC %q status to %q for osd orchestration. %s", nodeOrPVC, status.Status, status.Message)
 	}
 	return cmName
 }
@@ -133,7 +133,7 @@ func UpdateNodeStatus(kv *k8sutil.ConfigMapKVStore, node string, status Orchestr
 func (c *Cluster) handleOrchestrationFailure(errors *provisionErrors, nodeName, message string, args ...interface{}) {
 	errors.addError(message, args...)
 	status := OrchestrationStatus{Status: OrchestrationStatusFailed, Message: message}
-	UpdateNodeStatus(c.kv, nodeName, status)
+	UpdateNodeOrPVCStatus(c.clusterInfo.Context, c.kv, nodeName, status)
 }
 
 func parseOrchestrationStatus(data map[string]string) *OrchestrationStatus {
@@ -196,13 +196,12 @@ func (c *Cluster) updateAndCreateOSDsLoop(
 	errs *provisionErrors, // add errors here
 ) (shouldRestart bool, err error) {
 	cmClient := c.context.Clientset.CoreV1().ConfigMaps(c.clusterInfo.Namespace)
-	ctx := context.TODO()
 	selector := statusConfigMapSelector()
 
 	listOptions := metav1.ListOptions{
 		LabelSelector: selector,
 	}
-	configMapList, err := cmClient.List(ctx, listOptions)
+	configMapList, err := cmClient.List(c.clusterInfo.Context, listOptions)
 	if err != nil {
 		return false, errors.Wrapf(err, "failed to list OSD provisioning status ConfigMaps")
 	}
@@ -218,7 +217,7 @@ func (c *Cluster) updateAndCreateOSDsLoop(
 		Watch:           true,
 		ResourceVersion: configMapList.ResourceVersion,
 	}
-	watcher, err := cmClient.Watch(ctx, watchOptions)
+	watcher, err := cmClient.Watch(c.clusterInfo.Context, watchOptions)
 	defer watcher.Stop()
 	if err != nil {
 		return false, errors.Wrapf(err, "failed to start watching OSD provisioning status ConfigMaps")
@@ -269,9 +268,8 @@ func (c *Cluster) updateAndCreateOSDsLoop(
 			updateConfig.updateExistingOSDs(errs)
 
 		case <-minuteTicker.C:
-			// Check whether we need to cancel the orchestration
-			if err := controller.CheckForCancelledOrchestration(c.context); err != nil {
-				return false, err
+			if c.clusterInfo.Context.Err() != nil {
+				return false, c.clusterInfo.Context.Err()
 			}
 			// Log progress
 			c, cExp := createConfig.progress()
@@ -344,25 +342,24 @@ func statusConfigMapName(nodeOrPVCName string) string {
 }
 
 func (c *Cluster) deleteStatusConfigMap(nodeOrPVCName string) {
-	if err := c.kv.ClearStore(statusConfigMapName(nodeOrPVCName)); err != nil {
+	if err := c.kv.ClearStore(c.clusterInfo.Context, statusConfigMapName(nodeOrPVCName)); err != nil {
 		logger.Errorf("failed to remove the status configmap %q. %v", statusConfigMapName(nodeOrPVCName), err)
 	}
 }
 
 func (c *Cluster) deleteAllStatusConfigMaps() {
-	ctx := context.TODO()
 	listOpts := metav1.ListOptions{
 		LabelSelector: statusConfigMapSelector(),
 	}
 	cmClientset := c.context.Clientset.CoreV1().ConfigMaps(c.clusterInfo.Namespace)
-	cms, err := cmClientset.List(ctx, listOpts)
+	cms, err := cmClientset.List(c.clusterInfo.Context, listOpts)
 	if err != nil {
 		logger.Warningf("failed to clean up any dangling OSD prepare status configmaps. failed to list OSD prepare status configmaps. %v", err)
 		return
 	}
 	for _, cm := range cms.Items {
 		logger.Debugf("cleaning up dangling OSD prepare status configmap %q", cm.Name)
-		err := cmClientset.Delete(ctx, cm.Name, metav1.DeleteOptions{})
+		err := cmClientset.Delete(c.clusterInfo.Context, cm.Name, metav1.DeleteOptions{})
 		if err != nil {
 			logger.Warningf("failed to clean up dangling OSD prepare status configmap %q. %v", cm.Name, err)
 		}

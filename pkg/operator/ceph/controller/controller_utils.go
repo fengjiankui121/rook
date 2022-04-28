@@ -18,20 +18,35 @@ package controller
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"reflect"
+	"strconv"
 	"strings"
 	"time"
 
 	cephv1 "github.com/rook/rook/pkg/apis/ceph.rook.io/v1"
-	"github.com/rook/rook/pkg/clusterd"
 	"github.com/rook/rook/pkg/operator/k8sutil"
+	"github.com/rook/rook/pkg/util/exec"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
+
+// OperatorConfig represents the configuration of the operator
+type OperatorConfig struct {
+	OperatorNamespace string
+	Image             string
+	ServiceAccount    string
+	NamespaceToWatch  string
+	Parameters        map[string]string
+}
+
+// ClusterHealth is passed to the various monitoring go routines to stop them when the context is cancelled
+type ClusterHealth struct {
+	InternalCtx    context.Context
+	InternalCancel context.CancelFunc
+}
 
 const (
 	// OperatorSettingConfigMapName refers to ConfigMap that configures rook ceph operator
@@ -49,8 +64,15 @@ var (
 	// ImmediateRetryResult Return this for a immediate retry of the reconciliation loop with the same request object.
 	ImmediateRetryResult = reconcile.Result{Requeue: true}
 
+	// ImmediateRetryResultNoBackoff Return this for a immediate retry of the reconciliation loop with the same request object.
+	// Override the exponential backoff behavior by setting the RequeueAfter time explicitly.
+	ImmediateRetryResultNoBackoff = reconcile.Result{Requeue: true, RequeueAfter: time.Second}
+
 	// WaitForRequeueIfCephClusterNotReady waits for the CephCluster to be ready
 	WaitForRequeueIfCephClusterNotReady = reconcile.Result{Requeue: true, RequeueAfter: 10 * time.Second}
+
+	// WaitForRequeueIfCephClusterIsUpgrading waits until the upgrade is complete
+	WaitForRequeueIfCephClusterIsUpgrading = reconcile.Result{Requeue: true, RequeueAfter: time.Minute}
 
 	// WaitForRequeueIfFinalizerBlocked waits for resources to be cleaned up before the finalizer can be removed
 	WaitForRequeueIfFinalizerBlocked = reconcile.Result{Requeue: true, RequeueAfter: 10 * time.Second}
@@ -62,28 +84,19 @@ var (
 	OperatorCephBaseImageVersion string
 )
 
-func FlexDriverEnabled(context *clusterd.Context) bool {
-	// Ignore the error. In the remote chance that the configmap fails to be read, we will default to disabling the flex driver
-	value, _ := k8sutil.GetOperatorSetting(context.Clientset, OperatorSettingConfigMapName, "ROOK_ENABLE_FLEX_DRIVER", "false")
-	return value == "true"
+func DiscoveryDaemonEnabled(data map[string]string) bool {
+	return k8sutil.GetValue(data, "ROOK_ENABLE_DISCOVERY_DAEMON", "false") == "true"
 }
 
-func DiscoveryDaemonEnabled(context *clusterd.Context) bool {
-	// Ignore the error. In the remote chance that the configmap fails to be read, we will default to disabling the discovery daemon
-	value, _ := k8sutil.GetOperatorSetting(context.Clientset, OperatorSettingConfigMapName, "ROOK_ENABLE_DISCOVERY_DAEMON", "false")
-	return value == "true"
-}
-
-// CheckForCancelledOrchestration checks whether a cancellation has been requested
-func CheckForCancelledOrchestration(context *clusterd.Context) error {
-	defer context.RequestCancelOrchestration.UnSet()
-
-	// Check whether we need to cancel the orchestration
-	if context.RequestCancelOrchestration.IsSet() {
-		return errors.New("CANCELLING CURRENT ORCHESTRATION")
+// SetCephCommandsTimeout sets the timeout value of Ceph commands which are executed from Rook
+func SetCephCommandsTimeout(data map[string]string) {
+	strTimeoutSeconds := k8sutil.GetValue(data, "ROOK_CEPH_COMMANDS_TIMEOUT_SECONDS", "15")
+	timeoutSeconds, err := strconv.Atoi(strTimeoutSeconds)
+	if err != nil || timeoutSeconds < 1 {
+		logger.Warningf("ROOK_CEPH_COMMANDS_TIMEOUT is %q but it should be >= 1, set the default value 15", strTimeoutSeconds)
+		timeoutSeconds = 15
 	}
-
-	return nil
+	exec.CephCommandsTimeout = time.Duration(timeoutSeconds) * time.Second
 }
 
 // canIgnoreHealthErrStatusInReconcile determines whether a status of HEALTH_ERR in the CephCluster can be ignored safely.
@@ -106,14 +119,14 @@ func canIgnoreHealthErrStatusInReconcile(cephCluster cephv1.CephCluster, control
 }
 
 // IsReadyToReconcile determines if a controller is ready to reconcile or not
-func IsReadyToReconcile(c client.Client, clustercontext *clusterd.Context, namespacedName types.NamespacedName, controllerName string) (cephv1.CephCluster, bool, bool, reconcile.Result) {
+func IsReadyToReconcile(ctx context.Context, c client.Client, namespacedName types.NamespacedName, controllerName string) (cephv1.CephCluster, bool, bool, reconcile.Result) {
 	cephClusterExists := false
 
 	// Running ceph commands won't work and the controller will keep re-queuing so I believe it's fine not to check
 	// Make sure a CephCluster exists before doing anything
 	var cephCluster cephv1.CephCluster
 	clusterList := &cephv1.CephClusterList{}
-	err := c.List(context.TODO(), clusterList, client.InNamespace(namespacedName.Namespace))
+	err := c.List(ctx, clusterList, client.InNamespace(namespacedName.Namespace))
 	if err != nil {
 		logger.Errorf("%q: failed to fetch CephCluster %v", controllerName, err)
 		return cephCluster, false, cephClusterExists, ImmediateRetryResult
@@ -122,9 +135,15 @@ func IsReadyToReconcile(c client.Client, clustercontext *clusterd.Context, names
 		logger.Debugf("%q: no CephCluster resource found in namespace %q", controllerName, namespacedName.Namespace)
 		return cephCluster, false, cephClusterExists, WaitForRequeueIfCephClusterNotReady
 	}
-	cephClusterExists = true
 	cephCluster = clusterList.Items[0]
 
+	// If the cluster has a cleanup policy to destroy the cluster and it has been marked for deletion, treat it as if it does not exist
+	if cephCluster.Spec.CleanupPolicy.HasDataDirCleanPolicy() && !cephCluster.DeletionTimestamp.IsZero() {
+		logger.Infof("%q: CephCluster has a destructive cleanup policy, allowing %q to be deleted", controllerName, namespacedName)
+		return cephCluster, false, cephClusterExists, WaitForRequeueIfCephClusterNotReady
+	}
+
+	cephClusterExists = true
 	logger.Debugf("%q: CephCluster resource %q found in namespace %q", controllerName, cephCluster.Name, namespacedName.Namespace)
 
 	// read the CR status of the cluster

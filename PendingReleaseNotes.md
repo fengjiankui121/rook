@@ -1,17 +1,6 @@
-# Major Themes
-
-v1.7...
-
-## K8s Version Support
-
-## Upgrade Guides
+# v1.10 Pending Release Notes
 
 ## Breaking Changes
 
-### Ceph
 
 ## Features
-
-### Core
-
-### Ceph

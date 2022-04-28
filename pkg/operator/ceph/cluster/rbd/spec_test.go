@@ -48,7 +48,7 @@ func TestPodSpec(t *testing.T) {
 		},
 		Spec: cephv1.ClusterSpec{
 			CephVersion: cephv1.CephVersionSpec{
-				Image: "ceph/ceph:v15",
+				Image: "quay.io/ceph/ceph:v15",
 			},
 		},
 	}
@@ -75,7 +75,7 @@ func TestPodSpec(t *testing.T) {
 		TypeMeta: controllerTypeMeta,
 	}
 	clusterInfo := &cephclient.ClusterInfo{
-		CephVersion: cephver.Nautilus,
+		CephVersion: cephver.Octopus,
 	}
 	s := scheme.Scheme
 	object := []runtime.Object{rbdMirror}
@@ -93,10 +93,10 @@ func TestPodSpec(t *testing.T) {
 
 	// Deployment should have Ceph labels
 	test.AssertLabelsContainCephRequirements(t, d.ObjectMeta.Labels,
-		config.RbdMirrorType, "a", AppName, "ns")
+		config.RbdMirrorType, "a", AppName, "ns", "a", "cephrbdmirrors.ceph.rook.io", "ceph-rbd-mirror")
 
 	podTemplate := test.NewPodTemplateSpecTester(t, &d.Spec.Template)
-	podTemplate.RunFullSuite(config.RbdMirrorType, "a", AppName, "ns", "ceph/ceph:myceph",
+	podTemplate.RunFullSuite(config.RbdMirrorType, "a", AppName, "ns", "quay.io/ceph/ceph:myceph",
 		"200", "100", "600", "300", /* resources */
-		"my-priority-class")
+		"my-priority-class", "a", "cephrbdmirrors.ceph.rook.io", "ceph-rbd-mirror")
 }

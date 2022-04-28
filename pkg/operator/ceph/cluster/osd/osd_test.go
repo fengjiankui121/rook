@@ -35,7 +35,6 @@ import (
 	"github.com/rook/rook/pkg/operator/test"
 	exectest "github.com/rook/rook/pkg/util/exec/test"
 	"github.com/stretchr/testify/assert"
-	"github.com/tevino/abool"
 	apps "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
@@ -68,7 +67,8 @@ func TestStart(t *testing.T) {
 	clientset := fake.NewSimpleClientset()
 	clusterInfo := &cephclient.ClusterInfo{
 		Namespace:   "ns",
-		CephVersion: cephver.Nautilus,
+		CephVersion: cephver.Octopus,
+		Context:     context.TODO(),
 	}
 	context := &clusterd.Context{Clientset: clientset, ConfigDir: "/var/lib/rook", Executor: &exectest.MockExecutor{}}
 	spec := cephv1.ClusterSpec{}
@@ -132,7 +132,7 @@ func TestAddRemoveNode(t *testing.T) {
 	}()
 	// stub out the conditionExportFunc to do nothing. we do not have a fake Rook interface that
 	// allows us to interact with a CephCluster resource like the fake K8s clientset.
-	updateConditionFunc = func(c *clusterd.Context, namespaceName types.NamespacedName, conditionType cephv1.ConditionType, status corev1.ConditionStatus, reason cephv1.ClusterReasonType, message string) {
+	updateConditionFunc = func(ctx context.Context, c *clusterd.Context, namespaceName types.NamespacedName, observedGeneration int64, conditionType cephv1.ConditionType, status corev1.ConditionStatus, reason cephv1.ConditionReason, message string) {
 		// do nothing
 	}
 
@@ -150,23 +150,23 @@ func TestAddRemoveNode(t *testing.T) {
 
 	clusterInfo := &cephclient.ClusterInfo{
 		Namespace:   namespace,
-		CephVersion: cephver.Nautilus,
+		CephVersion: cephver.Octopus,
+		Context:     ctx,
 	}
 	clusterInfo.SetName("rook-ceph-test")
 	clusterInfo.OwnerInfo = cephclient.NewMinimumOwnerInfo(t)
 	generateKey := "expected key"
 	executor := &exectest.MockExecutor{
-		MockExecuteCommandWithOutputFile: func(command string, outFileArg string, args ...string) (string, error) {
+		MockExecuteCommandWithOutput: func(command string, args ...string) (string, error) {
 			return "{\"key\": \"" + generateKey + "\"}", nil
 		},
 	}
 
 	context := &clusterd.Context{
-		Clientset:                  clientset,
-		ConfigDir:                  "/var/lib/rook",
-		Executor:                   executor,
-		RequestCancelOrchestration: abool.New(),
-		RookClientset:              fakeclient.NewSimpleClientset(),
+		Clientset:     clientset,
+		ConfigDir:     "/var/lib/rook",
+		Executor:      executor,
+		RookClientset: fakeclient.NewSimpleClientset(),
 	}
 	spec := cephv1.ClusterSpec{
 		DataDirHostPath: context.ConfigDir,
@@ -209,7 +209,7 @@ func TestAddRemoveNode(t *testing.T) {
 
 	// mock the ceph calls that will be called during remove node
 	context.Executor = &exectest.MockExecutor{
-		MockExecuteCommandWithOutputFile: func(command, outputFile string, args ...string) (string, error) {
+		MockExecuteCommandWithOutput: func(command string, args ...string) (string, error) {
 			logger.Infof("Command: %s %v", command, args)
 			if args[0] == "status" {
 				return `{"pgmap":{"num_pgs":100,"pgs_by_state":[{"state_name":"active+clean","count":100}]}}`, nil
@@ -237,6 +237,9 @@ func TestAddRemoveNode(t *testing.T) {
 					}
 					if args[2] == "rm" {
 						return "", nil
+					}
+					if args[2] == "get-device-class" {
+						return cephclientfake.OSDDeviceClassOutput(args[3]), nil
 					}
 				}
 				if args[1] == "out" {
@@ -294,7 +297,7 @@ func TestAddRemoveNode(t *testing.T) {
 	assert.NoError(t, err)
 
 	removeIfOutAndSafeToRemove := true
-	healthMon := NewOSDHealthMonitor(context, cephclient.AdminClusterInfo(namespace), removeIfOutAndSafeToRemove, cephv1.CephClusterHealthCheckSpec{})
+	healthMon := NewOSDHealthMonitor(context, cephclient.AdminTestClusterInfo(namespace), removeIfOutAndSafeToRemove, cephv1.CephClusterHealthCheckSpec{})
 	healthMon.checkOSDHealth()
 	_, err = clientset.AppsV1().Deployments(namespace).Get(ctx, deploymentName(1), metav1.GetOptions{})
 	assert.True(t, k8serrors.IsNotFound(err))
@@ -320,11 +323,12 @@ func TestAddNodeFailure(t *testing.T) {
 
 	clusterInfo := &cephclient.ClusterInfo{
 		Namespace:   "ns-add-remove",
-		CephVersion: cephver.Nautilus,
+		CephVersion: cephver.Octopus,
+		Context:     context.TODO(),
 	}
 	clusterInfo.SetName("testcluster")
 	clusterInfo.OwnerInfo = cephclient.NewMinimumOwnerInfo(t)
-	context := &clusterd.Context{Clientset: clientset, ConfigDir: "/var/lib/rook", Executor: &exectest.MockExecutor{}, RequestCancelOrchestration: abool.New()}
+	context := &clusterd.Context{Clientset: clientset, ConfigDir: "/var/lib/rook", Executor: &exectest.MockExecutor{}}
 	spec := cephv1.ClusterSpec{
 		DataDirHostPath: context.ConfigDir,
 		Storage: cephv1.StorageScopeSpec{
@@ -490,7 +494,7 @@ func TestGetOSDInfo(t *testing.T) {
 	})
 }
 
-func TestOSDPlacement(t *testing.T) {
+func TestGetPreparePlacement(t *testing.T) {
 	// no placement
 	prop := osdProperties{}
 	result := prop.getPreparePlacement()

@@ -20,7 +20,6 @@ import (
 	"encoding/json"
 	"fmt"
 	osexec "os/exec"
-	"path"
 	"strconv"
 	"strings"
 
@@ -209,18 +208,7 @@ func GetDevicePropertiesFromPath(devicePath string, executor exec.Executor) (map
 	output, err := executor.ExecuteCommandWithOutput("lsblk", devicePath,
 		"--bytes", "--nodeps", "--pairs", "--paths", "--output", "SIZE,ROTA,RO,TYPE,PKNAME,NAME,KNAME")
 	if err != nil {
-		// The "not a block device" error also returns code 32 so the ExitStatus() check hides this error
-		if strings.Contains(output, "not a block device") {
-			return nil, err
-		}
-
-		// try to get more information about the command error
-		if code, ok := exec.ExitStatus(err); ok && code == 32 {
-			// certain device types (such as loop) return exit status 32 when probed further,
-			// ignore and continue without logging
-			return map[string]string{}, nil
-		}
-
+		logger.Errorf("failed to execute lsblk. output: %s", output)
 		return nil, err
 	}
 
@@ -418,13 +406,13 @@ func inventoryDevice(executor exec.Executor, devicePath string) (CephVolumeInven
 	args := []string{"inventory", "--format", "json", devicePath}
 	inventory, err := executor.ExecuteCommandWithOutput("ceph-volume", args...)
 	if err != nil {
-		return CVInventory, fmt.Errorf("failed to execute ceph-volume inventory on disk %q. %v", devicePath, err)
+		return CVInventory, fmt.Errorf("failed to execute ceph-volume inventory on disk %q. %s. %v", devicePath, inventory, err)
 	}
 
 	bInventory := []byte(inventory)
 	err = json.Unmarshal(bInventory, &CVInventory)
 	if err != nil {
-		return CVInventory, fmt.Errorf("error unmarshalling json data coming from ceph-volume inventory %q. %v", devicePath, err)
+		return CVInventory, fmt.Errorf("failed to unmarshal json data coming from ceph-volume inventory %q. %q. %v", devicePath, inventory, err)
 	}
 
 	return CVInventory, nil
@@ -464,11 +452,25 @@ func lvmList(executor exec.Executor, lv string) (CephVolumeLVMList, error) {
 }
 
 // ListDevicesChild list all child available on a device
+// For an encrypted device, it will return the encrypted device like so:
+// lsblk --noheadings --output NAME --path --list /dev/sdd
+// /dev/sdd
+// /dev/mapper/ocs-deviceset-thin-1-data-0hmfgp-block-dmcrypt
 func ListDevicesChild(executor exec.Executor, device string) ([]string, error) {
-	childListRaw, err := executor.ExecuteCommandWithOutput("lsblk", "--noheadings", "--pairs", path.Join("/dev", device))
+	childListRaw, err := executor.ExecuteCommandWithOutput("lsblk", "--noheadings", "--path", "--list", "--output", "NAME", device)
 	if err != nil {
 		return []string{}, fmt.Errorf("failed to list child devices of %q. %v", device, err)
 	}
 
 	return strings.Split(childListRaw, "\n"), nil
+}
+
+// IsDeviceEncrypted returns whether the disk has a "crypt" label on it
+func IsDeviceEncrypted(executor exec.Executor, device string) (bool, error) {
+	deviceType, err := executor.ExecuteCommandWithOutput("lsblk", "--noheadings", "--output", "TYPE", device)
+	if err != nil {
+		return false, fmt.Errorf("failed to get devices type of %q. %v", device, err)
+	}
+
+	return deviceType == "crypt", nil
 }

@@ -206,7 +206,7 @@ spec:
                   operator: In
                   values:
                     - cluster1
-                topologyKey: "failure-domain.beta.kubernetes.io/zone"
+              topologyKey: "failure-domain.beta.kubernetes.io/zone"
       volumeClaimTemplates:
       - spec:
           resources:
@@ -242,7 +242,7 @@ spec:
         memory: 4Gi
   storage:
     ...
-    storageClassDeviceSet:
+    storageClassDeviceSets:
     - name: cluster1-set1
       count: 3
       placement:
@@ -360,7 +360,7 @@ spec:
                   operator: In
                   values:
                     - cluster1
-                topologyKey: "failure-domain.beta.kubernetes.io/zone"
+              topologyKey: "failure-domain.beta.kubernetes.io/zone"
       volumeClaimTemplates:
       - spec:
           resources:
@@ -384,7 +384,7 @@ spec:
                   operator: In
                   values:
                     - cluster1
-                topologyKey: "failure-domain.beta.kubernetes.io/zone"
+              topologyKey: "failure-domain.beta.kubernetes.io/zone"
       volumeClaimTemplates:
       - spec:
           resources:
@@ -408,7 +408,7 @@ spec:
   ...
   storage:
     ...
-    storageClassDeviceSet:
+    storageClassDeviceSets:
     - name: cluster1-set1
       count: 3
       volumeClaimTemplates:
@@ -443,7 +443,7 @@ spec:
   ...
   storage:
     ...
-    storageClassDeviceSet:
+    storageClassDeviceSets:
     - name: cluster1-set1
       count: 3
       config:
@@ -486,7 +486,7 @@ spec:
   ...
   storage:
     ...
-    storageClassDeviceSet:
+    storageClassDeviceSets:
     - name: cluster1-set1
       count: 3
       config:

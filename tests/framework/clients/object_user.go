@@ -17,6 +17,7 @@ limitations under the License.
 package clients
 
 import (
+	"context"
 	"fmt"
 	"strings"
 
@@ -24,6 +25,7 @@ import (
 	rgw "github.com/rook/rook/pkg/operator/ceph/object"
 	"github.com/rook/rook/tests/framework/installer"
 	"github.com/rook/rook/tests/framework/utils"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 // ObjectUserOperation is wrapper for k8s rook object user operations
@@ -39,9 +41,16 @@ func CreateObjectUserOperation(k8sh *utils.K8sHelper, manifests installer.CephMa
 
 // ObjectUserGet Function to get the details of an object user from radosgw
 func (o *ObjectUserOperation) GetUser(namespace string, store string, userid string) (*rgw.ObjectUser, error) {
-	context := o.k8sh.MakeContext()
-	clusterInfo := client.AdminClusterInfo(namespace)
-	rgwcontext := rgw.NewContext(context, clusterInfo, store)
+	ctx := o.k8sh.MakeContext()
+	clusterInfo := client.AdminTestClusterInfo(namespace)
+	objectStore, err := o.k8sh.RookClientset.CephV1().CephObjectStores(namespace).Get(context.TODO(), store, metav1.GetOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("failed to get objectstore info: %+v", err)
+	}
+	rgwcontext, err := rgw.NewMultisiteContext(ctx, clusterInfo, objectStore)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get RGW context: %+v", err)
+	}
 	userinfo, _, err := rgw.GetUser(rgwcontext, userid)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get user info: %+v", err)
@@ -65,10 +74,10 @@ func (o *ObjectUserOperation) UserSecretExists(namespace string, store string, u
 }
 
 // ObjectUserCreate Function to create a object store user in rook
-func (o *ObjectUserOperation) Create(namespace string, userid string, displayName string, store string) error {
+func (o *ObjectUserOperation) Create(userid, displayName, store, usercaps, maxsize string, maxbuckets, maxobjects int) error {
 
 	logger.Infof("creating the object store user via CRD")
-	if err := o.k8sh.ResourceOperation("apply", o.manifests.GetObjectStoreUser(userid, displayName, store)); err != nil {
+	if err := o.k8sh.ResourceOperation("apply", o.manifests.GetObjectStoreUser(userid, displayName, store, usercaps, maxsize, maxbuckets, maxobjects)); err != nil {
 		return err
 	}
 	return nil

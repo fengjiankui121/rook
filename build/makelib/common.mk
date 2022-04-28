@@ -38,35 +38,18 @@ GOARCH := $(word 2, $(subst _, ,$(PLATFORM)))
 export GOOS GOARCH
 endif
 
-GOHOSTOS := $(shell go env GOHOSTOS)
+ALL_PLATFORMS ?= darwin_amd64 windows_amd64 linux_amd64 linux_arm64
+
+export GOARM
+
+# force the build of a linux binary when running on MacOS
+GOHOSTOS=linux
 GOHOSTARCH := $(shell go env GOHOSTARCH)
 HOST_PLATFORM := $(GOHOSTOS)_$(GOHOSTARCH)
 
-ALL_PLATFORMS ?= darwin_amd64 windows_amd64 linux_amd64 linux_arm64
-
-ifeq ($(PLATFORM),linux_amd64)
-CROSS_TRIPLE = x86_64-linux-gnu
-endif
-ifeq ($(PLATFORM),linux_arm64)
-CROSS_TRIPLE = aarch64-linux-gnu
-endif
-ifeq ($(PLATFORM),darwin_amd64)
-CROSS_TRIPLE=x86_64-apple-darwin15
-endif
-ifeq ($(PLATFORM),windows_amd64)
-CROSS_TRIPLE=x86_64-w64-mingw32
-endif
-export GOARM
-
-ifneq ($(PLATFORM),$(HOST_PLATFORM))
-CC := $(CROSS_TRIPLE)-gcc
-CXX := $(CROSS_TRIPLE)-g++
-export CC CXX
-endif
-
-# sed -i'' -e works on both UNIX (MacOS) and GNU (Linux) versions of sed
-SED_CMD ?= sed -i'' -e
-export SED_CMD
+# REAL_HOST_PLATFORM is used to determine the correct url to download the various binary tools from and it does not use
+# HOST_PLATFORM which is used to build the program.
+REAL_HOST_PLATFORM=$(shell go env GOHOSTOS)_$(GOHOSTARCH)
 
 # set the version number. you should not need to do this
 # for the majority of scenarios.
@@ -106,12 +89,15 @@ ifeq ($(BUILD_REGISTRY),build-)
 $(error Failed to get unique ID for host+dir. Check that '$(SHA256CMD)' functions or override SHA256CMD)
 endif
 
+SED_IN_PLACE = $(ROOT_DIR)/build/sed-in-place
+export SED_IN_PLACE
+
 # This is a neat little target that prints any variable value from the Makefile
 # Usage: make echo.IMAGES echo.PLATFORM
 echo.%: ; @echo $* = $($*)
 
 # Select which images (backends) to make; default to all possible images
-IMAGES ?= ceph nfs cassandra
+IMAGES ?= ceph
 
 COMMA := ,
 SPACE :=

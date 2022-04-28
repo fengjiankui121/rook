@@ -17,6 +17,7 @@ limitations under the License.
 package cluster
 
 import (
+	"context"
 	"os"
 	"testing"
 
@@ -87,6 +88,7 @@ func TestCheckStorageForNode(t *testing.T) {
 
 func TestOnK8sNode(t *testing.T) {
 	ns := "rook-ceph"
+	ctx := context.TODO()
 	cephCluster := fakeCluster(ns)
 	objects := []runtime.Object{
 		cephCluster,
@@ -95,7 +97,7 @@ func TestOnK8sNode(t *testing.T) {
 	client := getFakeClient(objects...)
 
 	executor := &exectest.MockExecutor{}
-	executor.MockExecuteCommandWithOutputFile = func(command, outputFile string, args ...string) (string, error) {
+	executor.MockExecuteCommandWithOutput = func(command string, args ...string) (string, error) {
 		return "", errors.New("failed to get osd list on host")
 	}
 	clientCluster := newClientCluster(client, ns, &clusterd.Context{
@@ -136,11 +138,11 @@ func TestOnK8sNode(t *testing.T) {
 	cephCluster.Status.Phase = k8sutil.ReadyStatus
 	client = getFakeClient(objects...)
 	clientCluster.client = client
-	b := clientCluster.onK8sNode(node)
+	b := clientCluster.onK8sNode(ctx, node)
 	assert.True(t, b)
 
 	// node will not reconcile
-	b = clientCluster.onK8sNode(node)
+	b = clientCluster.onK8sNode(ctx, node)
 	assert.False(t, b)
 }
 

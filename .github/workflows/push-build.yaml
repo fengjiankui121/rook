@@ -3,6 +3,15 @@ on:
   push:
     branches:
       - master
+      - release-*
+    tags:
+      - v*
+
+defaults:
+  run:
+    # reference: https://docs.github.com/en/actions/reference/workflow-syntax-for-github-actions#using-a-specific-shell
+    shell: bash --noprofile --norc -eo pipefail -x {0}
+
 jobs:
   push-image-to-container-registry:
     runs-on: ubuntu-18.04
@@ -10,8 +19,14 @@ jobs:
     steps:
       - name: checkout
         uses: actions/checkout@v2
+        with:
+          fetch-depth: 0
 
-       # docker/setup-qemu action installs QEMU static binaries, which are used to run builders for architectures other than the host.
+      - uses: actions/setup-go@v2
+        with:
+          go-version: 1.17
+
+        # docker/setup-qemu action installs QEMU static binaries, which are used to run builders for architectures other than the host.
       - name: set up QEMU
         uses: docker/setup-qemu-action@master
         with:
@@ -30,12 +45,11 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_PSW }}
           aws-region: us-east-1
 
-      - name: unshallow
-        run: git fetch --prune --unshallow --tags
-
       # creating custom env var
       - name: set env
-        run: echo "BRANCH_NAME=${GITHUB_REF##*/}" >> $GITHUB_ENV
+        run: |
+          echo "BRANCH_NAME=${GITHUB_REF##*/}" >> $GITHUB_ENV
+          echo "GITHUB_REF"=${GITHUB_REF} >> $GITHUB_ENV
 
       - name: build and release
         env:
@@ -43,4 +57,11 @@ jobs:
           BRANCH_NAME: ${{ env.BRANCH_NAME }}
           AWS_USR: ${{ secrets.AWS_USR }}
           AWS_PSW: ${{ secrets.AWS_PSW }}
-        run: tests/scripts/build-release.sh
+          GITHUB_REF: $ {{ env.GITHUB_REF }}
+        run: |
+          tests/scripts/build-release.sh
+
+      - name: setup tmate session for debugging
+        if: failure()
+        uses: mxschmitt/action-tmate@v3
+        timeout-minutes: 60

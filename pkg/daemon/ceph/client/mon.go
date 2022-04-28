@@ -17,7 +17,6 @@ package client
 
 import (
 	"encoding/json"
-	"fmt"
 	"strings"
 	"syscall"
 
@@ -65,6 +64,7 @@ type MonDump struct {
 	FSID             string         `json:"fsid"`
 	Mons             []MonDumpEntry `json:"mons"`
 	Quorum           []int          `json:"quorum"`
+	TiebreakerMon    string         `json:"tiebreaker_mon"`
 }
 
 type MonDumpEntry struct {
@@ -126,23 +126,10 @@ func CreateDefaultStretchCrushRule(context *clusterd.Context, clusterInfo *Clust
 		FailureDomain: failureDomain,
 		Replicated:    cephv1.ReplicatedSpec{SubFailureDomain: clusterSpec.Mon.StretchCluster.SubFailureDomain},
 	}
-	if err := createTwoStepCrushRule(context, clusterInfo, clusterSpec, defaultStretchCrushRuleName, pool); err != nil {
+	if err := createStretchCrushRule(context, clusterInfo, clusterSpec, defaultStretchCrushRuleName, pool); err != nil {
 		return errors.Wrap(err, "failed to create default stretch crush rule")
 	}
 	logger.Info("successfully created the default stretch crush rule")
-	return nil
-}
-
-// SetMonStretchZone sets the location of a mon in the stretch cluster
-func SetMonStretchZone(context *clusterd.Context, clusterInfo *ClusterInfo, monName, failureDomain, zone string) error {
-	args := []string{"mon", "set_location", monName, fmt.Sprintf("%s=%s", failureDomain, zone)}
-	buf, err := NewCephCommand(context, clusterInfo, args).Run()
-	if err != nil {
-		return errors.Wrap(err, "failed to set mon stretch zone")
-	}
-	output := string(buf)
-	logger.Debug(output)
-	logger.Infof("successfully set mon %q stretch zone to %q", monName, zone)
 	return nil
 }
 
@@ -155,7 +142,7 @@ func SetMonStretchTiebreaker(context *clusterd.Context, clusterInfo *ClusterInfo
 		if code, ok := exec.ExitStatus(err); ok && code == int(syscall.EINVAL) {
 			// TODO: Get a more distinctive error from ceph so we don't have to compare the error message
 			if strings.Contains(string(buf), "stretch mode is already engaged") {
-				logger.Infof("stretch mode is already enabled")
+				logger.Info("stretch mode is already enabled")
 				return nil
 			}
 			return errors.Wrapf(err, "stretch mode failed to be enabled. %s", string(buf))
@@ -164,5 +151,16 @@ func SetMonStretchTiebreaker(context *clusterd.Context, clusterInfo *ClusterInfo
 	}
 	logger.Debug(string(buf))
 	logger.Infof("successfully set mon tiebreaker %q in failure domain %q", monName, bucketType)
+	return nil
+}
+
+// SetNewTiebreaker sets the new tiebreaker mon in the stretch cluster during a failover
+func SetNewTiebreaker(context *clusterd.Context, clusterInfo *ClusterInfo, monName string) error {
+	logger.Infof("setting new mon tiebreaker %q in arbiter zone", monName)
+	args := []string{"mon", "set_new_tiebreaker", monName}
+	if _, err := NewCephCommand(context, clusterInfo, args).Run(); err != nil {
+		return errors.Wrapf(err, "failed to set new mon tiebreaker %q", monName)
+	}
+	logger.Infof("successfully set new mon tiebreaker %q in arbiter zone", monName)
 	return nil
 }

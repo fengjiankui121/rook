@@ -21,12 +21,16 @@ import (
 	"time"
 
 	"github.com/pkg/errors"
+	"github.com/rook/rook/pkg/clusterd"
 	"github.com/rook/rook/pkg/operator/ceph/cluster/mgr"
 	"github.com/rook/rook/pkg/operator/ceph/cluster/mon"
 	"github.com/rook/rook/pkg/operator/ceph/cluster/rbd"
 	appsv1 "k8s.io/api/apps/v1"
+	v1 "k8s.io/api/batch/v1"
+	"k8s.io/api/batch/v1beta1"
 	kerrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/version"
 
 	"github.com/rook/rook/pkg/operator/ceph/file/mds"
 	"github.com/rook/rook/pkg/operator/ceph/file/mirror"
@@ -45,7 +49,6 @@ import (
 	opcontroller "github.com/rook/rook/pkg/operator/ceph/controller"
 	"github.com/rook/rook/pkg/operator/ceph/disruption/controllerconfig"
 	cephver "github.com/rook/rook/pkg/operator/ceph/version"
-	"k8s.io/api/batch/v1beta1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
@@ -59,11 +62,18 @@ var (
 	waitForRequeueIfSecretNotCreated = reconcile.Result{Requeue: true, RequeueAfter: 30 * time.Second}
 )
 
+const (
+	MinVersionForCronV1 = "1.21.0"
+)
+
 // ReconcileNode reconciles ReplicaSets
 type ReconcileNode struct {
 	// client can be used to retrieve objects from the APIServer.
-	scheme *runtime.Scheme
-	client client.Client
+	scheme           *runtime.Scheme
+	client           client.Client
+	context          *clusterd.Context
+	opManagerContext context.Context
+	opConfig         opcontroller.OperatorConfig
 }
 
 // Reconcile reconciles a node and ensures that it has a crashcollector deployment
@@ -84,7 +94,7 @@ func (r *ReconcileNode) reconcile(request reconcile.Request) (reconcile.Result, 
 
 	// get the node object
 	node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: request.Name}}
-	err := r.client.Get(context.TODO(), request.NamespacedName, node)
+	err := r.client.Get(r.opManagerContext, request.NamespacedName, node)
 	if err != nil {
 		if kerrors.IsNotFound(err) {
 			// if a node is not present, check if there are any crashcollector deployment for that node and delete it.
@@ -122,7 +132,7 @@ func (r *ReconcileNode) reconcile(request reconcile.Request) (reconcile.Result, 
 	for namespace, cephPods := range namespaceToPodList {
 		// get dataDirHostPath from the CephCluster
 		cephClusters := &cephv1.CephClusterList{}
-		err := r.client.List(context.TODO(), cephClusters, client.InNamespace(namespace))
+		err := r.client.List(r.opManagerContext, cephClusters, client.InNamespace(namespace))
 		if err != nil {
 			return reconcile.Result{}, errors.Wrapf(err, "could not get cephcluster in namespaces %q", namespace)
 		}
@@ -142,7 +152,7 @@ func (r *ReconcileNode) reconcile(request reconcile.Request) (reconcile.Result, 
 			namespaceListOpts := client.InNamespace(request.Namespace)
 
 			// Try to fetch the list of existing deployment and remove them
-			err := r.client.List(context.TODO(), deploymentList, client.MatchingLabels{k8sutil.AppAttr: AppName}, namespaceListOpts)
+			err := r.client.List(r.opManagerContext, deploymentList, client.MatchingLabels{k8sutil.AppAttr: AppName}, namespaceListOpts)
 			if err != nil {
 				logger.Errorf("failed to list crash collector deployments, delete it/them manually. %v", err)
 				return reconcile.Result{}, nil
@@ -163,7 +173,7 @@ func (r *ReconcileNode) reconcile(request reconcile.Request) (reconcile.Result, 
 
 		// checking if secret "rook-ceph-crash-collector-keyring" is present which is required to create crashcollector pods
 		secret := &corev1.Secret{}
-		err = r.client.Get(context.TODO(), types.NamespacedName{Name: crashCollectorKeyName, Namespace: namespace}, secret)
+		err = r.client.Get(r.opManagerContext, types.NamespacedName{Name: crashCollectorKeyName, Namespace: namespace}, secret)
 		if err != nil {
 			if kerrors.IsNotFound(err) {
 				logger.Debugf("secret %q not found. retrying in %q. %v", crashCollectorKeyName, waitForRequeueIfSecretNotCreated.RequeueAfter.String(), err)
@@ -223,7 +233,7 @@ func (r *ReconcileNode) cephPodList() ([]corev1.Pod, error) {
 
 	for _, app := range cephAppNames {
 		podList := &corev1.PodList{}
-		err := r.client.List(context.TODO(), podList, client.MatchingLabels{k8sutil.AppAttr: app})
+		err := r.client.List(r.opManagerContext, podList, client.MatchingLabels{k8sutil.AppAttr: app})
 		if err != nil {
 			return cephPods, errors.Wrapf(err, "could not list the %q pods", app)
 		}
@@ -237,7 +247,7 @@ func (r *ReconcileNode) cephPodList() ([]corev1.Pod, error) {
 func (r *ReconcileNode) listCrashCollectorAndDelete(nodeName, ns string) error {
 	deploymentList := &appsv1.DeploymentList{}
 	namespaceListOpts := client.InNamespace(ns)
-	err := r.client.List(context.TODO(), deploymentList, client.MatchingLabels{k8sutil.AppAttr: AppName, NodeNameLabel: nodeName}, namespaceListOpts)
+	err := r.client.List(r.opManagerContext, deploymentList, client.MatchingLabels{k8sutil.AppAttr: AppName, NodeNameLabel: nodeName}, namespaceListOpts)
 	if err != nil {
 		return errors.Wrap(err, "failed to list crash collector deployments")
 	}
@@ -263,7 +273,7 @@ func (r *ReconcileNode) deleteCrashCollector(deployment appsv1.Deployment) error
 		},
 	}
 
-	err := r.client.Delete(context.TODO(), dep)
+	err := r.client.Delete(r.opManagerContext, dep)
 	if err != nil && !kerrors.IsNotFound(err) {
 		return errors.Wrapf(err, "could not delete crash collector deployment %q", deploymentName)
 	}
@@ -272,16 +282,34 @@ func (r *ReconcileNode) deleteCrashCollector(deployment appsv1.Deployment) error
 }
 
 func (r *ReconcileNode) reconcileCrashRetention(namespace string, cephCluster cephv1.CephCluster, cephVersion *cephver.CephVersion) error {
+	k8sVersion, err := k8sutil.GetK8SVersion(r.context.Clientset)
+	if err != nil {
+		return errors.Wrap(err, "failed to get k8s version")
+	}
+	useCronJobV1 := k8sVersion.AtLeast(version.MustParseSemantic(MinVersionForCronV1))
+
+	objectMeta := metav1.ObjectMeta{
+		Name:      prunerName,
+		Namespace: namespace,
+	}
+
 	if cephCluster.Spec.CrashCollector.DaysToRetain == 0 {
 		logger.Debug("deleting cronjob if it exists...")
-		cronJob := &v1beta1.CronJob{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      prunerName,
-				Namespace: namespace,
-			},
+
+		var cronJob client.Object
+		// minimum k8s version required for v1 cronJob is 'v1.21.0'. Apply v1 if k8s version is at least 'v1.21.0', else apply v1beta1 cronJob.
+		if useCronJobV1 {
+			// delete v1beta1 cronJob if it already exists
+			err = r.client.Delete(r.opManagerContext, &v1beta1.CronJob{ObjectMeta: objectMeta})
+			if err != nil && !kerrors.IsNotFound(err) {
+				return errors.Wrapf(err, "failed to delete CronJob v1beta1 %q", prunerName)
+			}
+			cronJob = &v1.CronJob{ObjectMeta: objectMeta}
+		} else {
+			cronJob = &v1beta1.CronJob{ObjectMeta: objectMeta}
 		}
 
-		err := r.client.Delete(context.TODO(), cronJob)
+		err := r.client.Delete(r.opManagerContext, cronJob)
 		if err != nil {
 			if kerrors.IsNotFound(err) {
 				logger.Debug("cronJob resource not found. Ignoring since object must be deleted.")
@@ -293,7 +321,7 @@ func (r *ReconcileNode) reconcileCrashRetention(namespace string, cephCluster ce
 		}
 	} else {
 		logger.Debugf("daysToRetain set to: %d", cephCluster.Spec.CrashCollector.DaysToRetain)
-		op, err := r.createOrUpdateCephCron(cephCluster, cephVersion)
+		op, err := r.createOrUpdateCephCron(cephCluster, cephVersion, useCronJobV1)
 		if err != nil {
 			return errors.Wrapf(err, "node reconcile failed on op %q", op)
 		}

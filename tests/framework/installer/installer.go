@@ -18,7 +18,6 @@ package installer
 
 import (
 	"fmt"
-	"strings"
 	"testing"
 
 	"github.com/coreos/pkg/capnslog"
@@ -28,8 +27,8 @@ import (
 )
 
 const (
-	// VersionMaster tag for the latest manifests
-	VersionMaster = "master"
+	// LocalBuildTag tag for the latest manifests
+	LocalBuildTag = "local-build"
 
 	// test suite names
 	CassandraTestSuite = "cassandra"
@@ -44,22 +43,6 @@ var (
 	deleteArgs          = []string{"delete", "-f"}
 	deleteFromStdinArgs = append(deleteArgs, "-")
 )
-
-func SkipTestSuite(name string) bool {
-	testsToRun := testStorageProvider()
-	// jenkins passes "null" if the env var is not set.
-	if testsToRun == "" || testsToRun == "null" {
-		// run all test suites
-		return false
-	}
-	if strings.EqualFold(testsToRun, name) {
-		// this suite was requested
-		return false
-	}
-
-	logger.Infof("skipping test suite since only %s should be tested rather than %s", testsToRun, name)
-	return true
-}
 
 func SystemNamespace(namespace string) string {
 	if utils.IsPlatformOpenShift() {

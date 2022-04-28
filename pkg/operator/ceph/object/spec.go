@@ -29,6 +29,7 @@ import (
 	"github.com/rook/rook/pkg/daemon/ceph/osd/kms"
 	cephconfig "github.com/rook/rook/pkg/operator/ceph/config"
 	"github.com/rook/rook/pkg/operator/ceph/controller"
+	cephver "github.com/rook/rook/pkg/operator/ceph/version"
 	"github.com/rook/rook/pkg/operator/k8sutil"
 	apps "k8s.io/api/apps/v1"
 	v1 "k8s.io/api/core/v1"
@@ -37,19 +38,20 @@ import (
 )
 
 const (
-	livenessProbePath = "/swift/healthcheck"
-	// #nosec G101 since this is not leaking any hardcoded details
+	readinessProbePath = "/swift/healthcheck"
+	serviceAccountName = "rook-ceph-rgw"
+	//nolint:gosec // since this is not leaking any hardcoded details
 	setupVaultTokenFile = `
 set -e
 
 VAULT_TOKEN_OLD_PATH=%s
 VAULT_TOKEN_NEW_PATH=%s
 
-cp --verbose $VAULT_TOKEN_OLD_PATH $VAULT_TOKEN_NEW_PATH
+cp --recursive --verbose $VAULT_TOKEN_OLD_PATH/..data/. $VAULT_TOKEN_NEW_PATH
 
-chmod --verbose 400 $VAULT_TOKEN_NEW_PATH
-
-chown --verbose ceph:ceph $VAULT_TOKEN_NEW_PATH
+chmod --recursive --verbose 400 $VAULT_TOKEN_NEW_PATH/*
+chmod --verbose 700 $VAULT_TOKEN_NEW_PATH
+chown --recursive --verbose ceph:ceph $VAULT_TOKEN_NEW_PATH
 `
 )
 
@@ -59,9 +61,19 @@ func (c *clusterConfig) createDeployment(rgwConfig *rgwConfig) (*apps.Deployment
 		return nil, err
 	}
 	replicas := int32(1)
-	// On Pacific, we can use the same keyring and have dedicated rgw instances reflected in the service map
+	strategy := apps.DeploymentStrategy{
+		Type: apps.RecreateDeploymentStrategyType,
+	}
 	if c.clusterInfo.CephVersion.IsAtLeastPacific() {
+		// On Pacific, we can use the same keyring and have dedicated rgw instances reflected in the service map
 		replicas = c.store.Spec.Gateway.Instances
+
+		// On Pacific, rgw gateway deployments rolling update
+		strategy.Type = apps.RollingUpdateDeploymentStrategyType
+		strategy.RollingUpdate = &apps.RollingUpdateDeployment{
+			MaxUnavailable: &intstr.IntOrString{IntVal: int32(1)},
+			MaxSurge:       &intstr.IntOrString{IntVal: int32(0)},
+		}
 	}
 	d := &apps.Deployment{
 		ObjectMeta: metav1.ObjectMeta{
@@ -75,9 +87,7 @@ func (c *clusterConfig) createDeployment(rgwConfig *rgwConfig) (*apps.Deployment
 			},
 			Template: pod,
 			Replicas: &replicas,
-			Strategy: apps.DeploymentStrategy{
-				Type: apps.RecreateDeploymentStrategyType,
-			},
+			Strategy: strategy,
 		},
 	}
 	k8sutil.AddRookVersionLabelToDeployment(d)
@@ -103,15 +113,16 @@ func (c *clusterConfig) makeRGWPodSpec(rgwConfig *rgwConfig) (v1.PodTemplateSpec
 			controller.DaemonVolumes(c.DataPathMap, rgwConfig.ResourceName),
 			c.mimeTypesVolume(),
 		),
-		HostNetwork:       c.clusterSpec.Network.IsHost(),
-		PriorityClassName: c.store.Spec.Gateway.PriorityClassName,
+		HostNetwork:        c.clusterSpec.Network.IsHost(),
+		PriorityClassName:  c.store.Spec.Gateway.PriorityClassName,
+		ServiceAccountName: serviceAccountName,
 	}
 
 	// If the log collector is enabled we add the side-car container
 	if c.clusterSpec.LogCollector.Enabled {
 		shareProcessNamespace := true
 		podSpec.ShareProcessNamespace = &shareProcessNamespace
-		podSpec.Containers = append(podSpec.Containers, *controller.LogCollectorContainer(strings.TrimPrefix(generateCephXUser(fmt.Sprintf("ceph-client.%s", rgwConfig.ResourceName)), "client."), c.clusterInfo.Namespace, *c.clusterSpec))
+		podSpec.Containers = append(podSpec.Containers, *controller.LogCollectorContainer(getDaemonName(rgwConfig), c.clusterInfo.Namespace, *c.clusterSpec))
 	}
 
 	// Replace default unreachable node toleration
@@ -119,7 +130,7 @@ func (c *clusterConfig) makeRGWPodSpec(rgwConfig *rgwConfig) (v1.PodTemplateSpec
 
 	// Set the ssl cert if specified
 	if c.store.Spec.Gateway.SecurePort != 0 {
-		secretVolSrc, err := generateVolumeSourceWithTLSSecret(c.store.Spec)
+		secretVolSrc, err := c.generateVolumeSourceWithTLSSecret()
 		if err != nil {
 			return v1.PodTemplateSpec{}, err
 		}
@@ -130,14 +141,43 @@ func (c *clusterConfig) makeRGWPodSpec(rgwConfig *rgwConfig) (v1.PodTemplateSpec
 			}}
 		podSpec.Volumes = append(podSpec.Volumes, certVol)
 	}
+	// Check custom caBundle provided
+	if c.store.Spec.Gateway.CaBundleRef != "" {
+		customCaBundleVolSrc, err := c.generateVolumeSourceWithCaBundleSecret()
+		if err != nil {
+			return v1.PodTemplateSpec{}, err
+		}
+		customCaBundleVol := v1.Volume{
+			Name: caBundleVolumeName,
+			VolumeSource: v1.VolumeSource{
+				Secret: customCaBundleVolSrc,
+			}}
+		podSpec.Volumes = append(podSpec.Volumes, customCaBundleVol)
+		updatedCaBundleVol := v1.Volume{
+			Name: caBundleUpdatedVolumeName,
+			VolumeSource: v1.VolumeSource{
+				EmptyDir: &v1.EmptyDirVolumeSource{},
+			}}
+		podSpec.Volumes = append(podSpec.Volumes, updatedCaBundleVol)
+		podSpec.InitContainers = append(podSpec.InitContainers,
+			c.createCaBundleUpdateInitContainer(rgwConfig))
+	}
 	kmsEnabled, err := c.CheckRGWKMS()
 	if err != nil {
 		return v1.PodTemplateSpec{}, err
 	}
 	if kmsEnabled {
 		if c.store.Spec.Security.KeyManagementService.IsTokenAuthEnabled() {
-			podSpec.Volumes = append(podSpec.Volumes,
-				kms.VaultTokenFileVolume(c.store.Spec.Security.KeyManagementService.TokenSecretName))
+			vaultFileVol, _ := kms.VaultVolumeAndMount(c.store.Spec.Security.KeyManagementService.ConnectionDetails,
+				c.store.Spec.Security.KeyManagementService.TokenSecretName)
+			tmpvolume := v1.Volume{
+				Name: rgwVaultVolumeName,
+				VolumeSource: v1.VolumeSource{
+					EmptyDir: &v1.EmptyDirVolumeSource{},
+				},
+			}
+
+			podSpec.Volumes = append(podSpec.Volumes, vaultFileVol, tmpvolume)
 			podSpec.InitContainers = append(podSpec.InitContainers,
 				c.vaultTokenInitContainer(rgwConfig))
 		}
@@ -169,26 +209,47 @@ func (c *clusterConfig) makeRGWPodSpec(rgwConfig *rgwConfig) (v1.PodTemplateSpec
 	return podTemplateSpec, nil
 }
 
+func (c *clusterConfig) createCaBundleUpdateInitContainer(rgwConfig *rgwConfig) v1.Container {
+	caBundleMount := v1.VolumeMount{Name: caBundleVolumeName, MountPath: caBundleSourceCustomDir, ReadOnly: true}
+	volumeMounts := append(controller.DaemonVolumeMounts(c.DataPathMap, rgwConfig.ResourceName), caBundleMount)
+	updatedCaBundleDir := "/tmp/new-ca-bundle/"
+	updatedBundleMount := v1.VolumeMount{Name: caBundleUpdatedVolumeName, MountPath: updatedCaBundleDir, ReadOnly: false}
+	volumeMounts = append(volumeMounts, updatedBundleMount)
+	return v1.Container{
+		Name:    "update-ca-bundle-initcontainer",
+		Command: []string{"/bin/bash", "-c"},
+		// copy all content of caBundleExtractedDir to avoid directory mount itself
+		Args: []string{
+			fmt.Sprintf("/usr/bin/update-ca-trust extract; cp -rf %s/* %s", caBundleExtractedDir, updatedCaBundleDir),
+		},
+		Image:           c.clusterSpec.CephVersion.Image,
+		VolumeMounts:    volumeMounts,
+		Resources:       c.store.Spec.Gateway.Resources,
+		SecurityContext: controller.PodSecurityContext(),
+	}
+}
+
 // The vault token is passed as Secret for rgw container. So it is mounted as read only.
-// RGW has restrictions over vault token file, it should owned by same user(ceph) which
+// RGW has restrictions over vault token file, it should owned by same user (ceph) which
 // rgw daemon runs and all other permission should be nil or zero. Here ownership can be
 // changed with help of FSGroup but in openshift environments for security reasons it has
-// predefined value, so it won't work there. Hence the token file is copied to containerDataDir
-// from mounted secret then ownership/permissions are changed accordingly with help of a
-// init container.
+// predefined value, so it won't work there. Hence the token file and certs (if present)
+// are copied to other volume from mounted secrets then ownership/permissions are changed
+// accordingly with help of an init container.
 func (c *clusterConfig) vaultTokenInitContainer(rgwConfig *rgwConfig) v1.Container {
-	_, volMount := kms.VaultVolumeAndMount(c.store.Spec.Security.KeyManagementService.ConnectionDetails)
+	_, srcVaultVolMount := kms.VaultVolumeAndMount(c.store.Spec.Security.KeyManagementService.ConnectionDetails, "")
+	tmpVaultMount := v1.VolumeMount{Name: rgwVaultVolumeName, MountPath: rgwVaultDirName}
 	return v1.Container{
 		Name: "vault-initcontainer-token-file-setup",
 		Command: []string{
 			"/bin/bash",
 			"-c",
 			fmt.Sprintf(setupVaultTokenFile,
-				path.Join(kms.EtcVaultDir, kms.VaultFileName), path.Join(c.DataPathMap.ContainerDataDir, kms.VaultFileName)),
+				kms.EtcVaultDir, rgwVaultDirName),
 		},
 		Image: c.clusterSpec.CephVersion.Image,
 		VolumeMounts: append(
-			controller.DaemonVolumeMounts(c.DataPathMap, rgwConfig.ResourceName), volMount),
+			controller.DaemonVolumeMounts(c.DataPathMap, rgwConfig.ResourceName), srcVaultVolMount, tmpVaultMount),
 		Resources:       c.store.Spec.Gateway.Resources,
 		SecurityContext: controller.PodSecurityContext(),
 	}
@@ -229,21 +290,31 @@ func (c *clusterConfig) makeDaemonContainer(rgwConfig *rgwConfig) v1.Container {
 		),
 		Env:             controller.DaemonEnvVars(c.clusterSpec.CephVersion.Image),
 		Resources:       c.store.Spec.Gateway.Resources,
-		LivenessProbe:   c.generateLiveProbe(),
+		StartupProbe:    c.defaultStartupProbe(),
+		LivenessProbe:   c.defaultLivenessProbe(),
+		ReadinessProbe:  c.defaultReadinessProbe(),
 		SecurityContext: controller.PodSecurityContext(),
 		WorkingDir:      cephconfig.VarLogCephDir,
 	}
 
+	// If the startup probe is enabled
+	container = cephconfig.ConfigureStartupProbe(container, c.store.Spec.HealthCheck.StartupProbe)
 	// If the liveness probe is enabled
-	configureLivenessProbe(&container, c.store.Spec.HealthCheck)
+	container = cephconfig.ConfigureLivenessProbe(container, c.store.Spec.HealthCheck.LivenessProbe)
+	// If the readiness probe is enabled
+	configureReadinessProbe(&container, c.store.Spec.HealthCheck)
 	if c.store.Spec.IsTLSEnabled() {
 		// Add a volume mount for the ssl certificate
 		mount := v1.VolumeMount{Name: certVolumeName, MountPath: certDir, ReadOnly: true}
 		container.VolumeMounts = append(container.VolumeMounts, mount)
 	}
+	if c.store.Spec.Gateway.CaBundleRef != "" {
+		updatedBundleMount := v1.VolumeMount{Name: caBundleUpdatedVolumeName, MountPath: caBundleExtractedDir, ReadOnly: true}
+		container.VolumeMounts = append(container.VolumeMounts, updatedBundleMount)
+	}
 	kmsEnabled, err := c.CheckRGWKMS()
 	if err != nil {
-		logger.Errorf("enabling KMS failed %v", err)
+		logger.Errorf("failed to enable KMS. %v", err)
 		return v1.Container{}
 	}
 	if kmsEnabled {
@@ -257,46 +328,83 @@ func (c *clusterConfig) makeDaemonContainer(rgwConfig *rgwConfig) v1.Container {
 			container.Args = append(container.Args,
 				cephconfig.NewFlag("rgw crypt vault auth", kms.KMSTokenSecretNameKey),
 				cephconfig.NewFlag("rgw crypt vault token file",
-					path.Join(c.DataPathMap.ContainerDataDir, kms.VaultFileName)),
+					path.Join(rgwVaultDirName, kms.VaultFileName)),
 				cephconfig.NewFlag("rgw crypt vault prefix", c.vaultPrefixRGW()),
 				cephconfig.NewFlag("rgw crypt vault secret engine",
 					c.store.Spec.Security.KeyManagementService.ConnectionDetails[kms.VaultSecretEngineKey]),
 			)
 		}
+		if c.store.Spec.Security.KeyManagementService.IsTLSEnabled() &&
+			c.clusterInfo.CephVersion.IsAtLeast(cephver.CephVersion{Major: 16, Minor: 2, Extra: 6}) {
+			container.Args = append(container.Args,
+				cephconfig.NewFlag("rgw crypt vault verify ssl", "true"))
+			if kms.GetParam(c.store.Spec.Security.KeyManagementService.ConnectionDetails, api.EnvVaultClientCert) != "" {
+				container.Args = append(container.Args,
+					cephconfig.NewFlag("rgw crypt vault ssl clientcert", path.Join(rgwVaultDirName, kms.VaultCertFileName)))
+			}
+			if kms.GetParam(c.store.Spec.Security.KeyManagementService.ConnectionDetails, api.EnvVaultClientKey) != "" {
+				container.Args = append(container.Args,
+					cephconfig.NewFlag("rgw crypt vault ssl clientkey", path.Join(rgwVaultDirName, kms.VaultKeyFileName)))
+			}
+			if kms.GetParam(c.store.Spec.Security.KeyManagementService.ConnectionDetails, api.EnvVaultCACert) != "" {
+				container.Args = append(container.Args,
+					cephconfig.NewFlag("rgw crypt vault ssl cacert", path.Join(rgwVaultDirName, kms.VaultCAFileName)))
+			}
+		}
+		vaultVolMount := v1.VolumeMount{Name: rgwVaultVolumeName, MountPath: rgwVaultDirName}
+		container.VolumeMounts = append(container.VolumeMounts, vaultVolMount)
 	}
 	return container
 }
 
-// configureLivenessProbe returns the desired liveness probe for a given daemon
-func configureLivenessProbe(container *v1.Container, healthCheck cephv1.BucketHealthCheckSpec) {
-	if ok := healthCheck.LivenessProbe; ok != nil {
-		if !healthCheck.LivenessProbe.Disabled {
-			probe := healthCheck.LivenessProbe.Probe
+// configureReadinessProbe returns the desired readiness probe for a given daemon
+func configureReadinessProbe(container *v1.Container, healthCheck cephv1.BucketHealthCheckSpec) {
+	if ok := healthCheck.ReadinessProbe; ok != nil {
+		if !healthCheck.ReadinessProbe.Disabled {
+			probe := healthCheck.ReadinessProbe.Probe
 			// If the spec value is empty, let's use a default
 			if probe != nil {
-				// Set the liveness probe on the container to overwrite the default probe created by Rook
-				container.LivenessProbe = cephconfig.GetLivenessProbeWithDefaults(probe, container.LivenessProbe)
+				// Set the readiness probe on the container to overwrite the default probe created by Rook
+				container.ReadinessProbe = cephconfig.GetProbeWithDefaults(probe, container.ReadinessProbe)
 			}
 		} else {
-			container.LivenessProbe = nil
+			container.ReadinessProbe = nil
 		}
 	}
 }
 
-func (c *clusterConfig) generateLiveProbe() *v1.Probe {
+func (c *clusterConfig) defaultLivenessProbe() *v1.Probe {
 	return &v1.Probe{
-		Handler: v1.Handler{
-			HTTPGet: &v1.HTTPGetAction{
-				Path:   livenessProbePath,
-				Port:   c.generateLiveProbePort(),
-				Scheme: c.generateLiveProbeScheme(),
+		ProbeHandler: v1.ProbeHandler{
+			TCPSocket: &v1.TCPSocketAction{
+				Port: c.generateProbePort(),
 			},
 		},
 		InitialDelaySeconds: 10,
 	}
 }
 
-func (c *clusterConfig) generateLiveProbeScheme() v1.URIScheme {
+func (c *clusterConfig) defaultReadinessProbe() *v1.Probe {
+	return &v1.Probe{
+		ProbeHandler: v1.ProbeHandler{
+			HTTPGet: &v1.HTTPGetAction{
+				Path:   readinessProbePath,
+				Port:   c.generateProbePort(),
+				Scheme: c.generateReadinessProbeScheme(),
+			},
+		},
+		InitialDelaySeconds: 10,
+	}
+}
+
+func (c *clusterConfig) defaultStartupProbe() *v1.Probe {
+	probe := c.defaultLivenessProbe()
+	probe.PeriodSeconds = 10
+	probe.FailureThreshold = 18
+	return probe
+}
+
+func (c *clusterConfig) generateReadinessProbeScheme() v1.URIScheme {
 	// Default to HTTP
 	uriScheme := v1.URISchemeHTTP
 
@@ -309,7 +417,7 @@ func (c *clusterConfig) generateLiveProbeScheme() v1.URIScheme {
 	return uriScheme
 }
 
-func (c *clusterConfig) generateLiveProbePort() intstr.IntOrString {
+func (c *clusterConfig) generateProbePort() intstr.IntOrString {
 	// The port the liveness probe needs to probe
 	// Assume we run on SDN by default
 	port := intstr.FromInt(int(rgwPortInternalPort))
@@ -341,7 +449,7 @@ func (c *clusterConfig) generateService(cephObjectStore *cephv1.CephObjectStore)
 		svc.Spec.ClusterIP = v1.ClusterIPNone
 	}
 
-	destPort := c.generateLiveProbePort()
+	destPort := c.generateProbePort()
 
 	// When the cluster is external we must use the same one as the gateways are listening on
 	if cephObjectStore.Spec.IsExternal() {
@@ -391,7 +499,7 @@ func (c *clusterConfig) reconcileExternalEndpoint(cephObjectStore *cephv1.CephOb
 		return errors.Wrapf(err, "failed to set owner reference to ceph object store endpoint %q", endpoint.Name)
 	}
 
-	_, err = k8sutil.CreateOrUpdateEndpoint(c.context.Clientset, cephObjectStore.Namespace, endpoint)
+	_, err = k8sutil.CreateOrUpdateEndpoint(c.clusterInfo.Context, c.context.Clientset, cephObjectStore.Namespace, endpoint)
 	if err != nil {
 		return errors.Wrapf(err, "failed to create or update object store %q endpoint", cephObjectStore.Name)
 	}
@@ -407,7 +515,7 @@ func (c *clusterConfig) reconcileService(cephObjectStore *cephv1.CephObjectStore
 		return "", errors.Wrapf(err, "failed to set owner reference to ceph object store service %q", service.Name)
 	}
 
-	svc, err := k8sutil.CreateOrUpdateService(c.context.Clientset, cephObjectStore.Namespace, service)
+	svc, err := k8sutil.CreateOrUpdateService(c.clusterInfo.Context, c.context.Clientset, cephObjectStore.Namespace, service)
 	if err != nil {
 		return "", errors.Wrapf(err, "failed to create or update object store %q service", cephObjectStore.Name)
 	}
@@ -427,7 +535,7 @@ func (c *clusterConfig) vaultPrefixRGW() string {
 			c.store.Spec.Security.KeyManagementService.ConnectionDetails[vault.VaultBackendPathKey], "/data")
 	case kms.VaultTransitSecretEngineKey:
 		if c.clusterInfo.CephVersion.IsAtLeastPacific() {
-			vaultPrefixPath = path.Join(vaultPrefixPath, secretEngine, "/transit")
+			vaultPrefixPath = path.Join(vaultPrefixPath, secretEngine)
 		} else {
 			vaultPrefixPath = path.Join(vaultPrefixPath, secretEngine, "/export/encryption-key")
 		}
@@ -438,18 +546,24 @@ func (c *clusterConfig) vaultPrefixRGW() string {
 
 func (c *clusterConfig) CheckRGWKMS() (bool, error) {
 	if c.store.Spec.Security != nil && c.store.Spec.Security.KeyManagementService.IsEnabled() {
-		err := kms.ValidateConnectionDetails(c.context, *c.store.Spec.Security, c.store.Namespace)
+		err := kms.ValidateConnectionDetails(c.clusterInfo.Context, c.context, c.store.Spec.Security, c.store.Namespace)
 		if err != nil {
 			return false, err
 		}
 		secretEngine := c.store.Spec.Security.KeyManagementService.ConnectionDetails[kms.VaultSecretEngineKey]
-		kvVers := c.store.Spec.Security.KeyManagementService.ConnectionDetails[vault.VaultBackendKey]
 
 		// currently RGW supports kv(version 2) and transit secret engines in vault
 		switch secretEngine {
 		case kms.VaultKVSecretEngineKey:
-			if kvVers != "v2" {
-				return false, errors.New("failed to validate vault kv version, only v2 is supported")
+			kvVers := c.store.Spec.Security.KeyManagementService.ConnectionDetails[vault.VaultBackendKey]
+			if kvVers != "" {
+				if kvVers != "v2" {
+					return false, errors.New("failed to validate vault kv version, only v2 is supported")
+				}
+			} else {
+				// If VAUL_BACKEND is not specified let's assume it's v2
+				logger.Warningf("%s is not set, assuming the only supported version 2", vault.VaultBackendKey)
+				c.store.Spec.Security.KeyManagementService.ConnectionDetails[vault.VaultBackendKey] = "v2"
 			}
 			return true, nil
 		case kms.VaultTransitSecretEngineKey:
@@ -459,6 +573,7 @@ func (c *clusterConfig) CheckRGWKMS() (bool, error) {
 
 		}
 	}
+
 	return false, nil
 }
 
@@ -487,34 +602,79 @@ func addPortToEndpoint(endpoints *v1.Endpoints, name string, port int32) {
 }
 
 func getLabels(name, namespace string, includeNewLabels bool) map[string]string {
-	labels := controller.CephDaemonAppLabels(AppName, namespace, "rgw", name, includeNewLabels)
+	labels := controller.CephDaemonAppLabels(AppName, namespace, cephconfig.RgwType, name, name, "cephobjectstores.ceph.rook.io", includeNewLabels)
 	labels["rook_object_store"] = name
 	return labels
 }
 
-func generateVolumeSourceWithTLSSecret(objSpec cephv1.ObjectStoreSpec) (*v1.SecretVolumeSource, error) {
+func (c *clusterConfig) generateVolumeSourceWithTLSSecret() (*v1.SecretVolumeSource, error) {
 	// Keep the TLS secret as secure as possible in the container. Give only user read perms.
 	// Because the Secret mount is owned by "root" and fsGroup breaks on OCP since we cannot predict it
 	// Also, we don't want to change the SCC for fsGroup to RunAsAny since it has a major broader impact
 	// Let's open the permissions a bit more so that everyone can read the cert.
 	userReadOnly := int32(0444)
 	var secretVolSrc *v1.SecretVolumeSource
-	if objSpec.Gateway.SSLCertificateRef != "" {
+	if c.store.Spec.Gateway.SSLCertificateRef != "" {
 		secretVolSrc = &v1.SecretVolumeSource{
-			SecretName: objSpec.Gateway.SSLCertificateRef,
-			Items: []v1.KeyToPath{
+			SecretName: c.store.Spec.Gateway.SSLCertificateRef,
+		}
+		secretType, err := c.rgwTLSSecretType(c.store.Spec.Gateway.SSLCertificateRef)
+		if err != nil {
+			return nil, err
+		}
+		switch secretType {
+		case v1.SecretTypeOpaque:
+			secretVolSrc.Items = []v1.KeyToPath{
 				{Key: certKeyName, Path: certFilename, Mode: &userReadOnly},
-			}}
-	} else if objSpec.GetServiceServingCert() != "" {
+			}
+		case v1.SecretTypeTLS:
+			secretVolSrc.Items = []v1.KeyToPath{
+				{Key: v1.TLSCertKey, Path: certFilename, Mode: &userReadOnly},
+				{Key: v1.TLSPrivateKeyKey, Path: certKeyFileName, Mode: &userReadOnly},
+			}
+		}
+	} else if c.store.Spec.GetServiceServingCert() != "" {
 		secretVolSrc = &v1.SecretVolumeSource{
-			SecretName: objSpec.GetServiceServingCert(),
+			SecretName: c.store.Spec.GetServiceServingCert(),
 			Items: []v1.KeyToPath{
-				{Key: "tls.crt", Path: certFilename, Mode: &userReadOnly},
-				{Key: "tls.key", Path: certKeyFileName, Mode: &userReadOnly},
+				{Key: v1.TLSCertKey, Path: certFilename, Mode: &userReadOnly},
+				{Key: v1.TLSPrivateKeyKey, Path: certKeyFileName, Mode: &userReadOnly},
 			}}
 	} else {
 		return nil, errors.New("no TLS certificates found")
 	}
 
 	return secretVolSrc, nil
+}
+
+func (c *clusterConfig) generateVolumeSourceWithCaBundleSecret() (*v1.SecretVolumeSource, error) {
+	// Keep the ca-bundle as secure as possible in the container. Give only user read perms.
+	// Same as above for generateVolumeSourceWithTLSSecret function.
+	userReadOnly := int32(0400)
+	caBundleVolSrc := &v1.SecretVolumeSource{
+		SecretName: c.store.Spec.Gateway.CaBundleRef,
+	}
+	secretType, err := c.rgwTLSSecretType(c.store.Spec.Gateway.CaBundleRef)
+	if err != nil {
+		return nil, err
+	}
+	if secretType != v1.SecretTypeOpaque {
+		return nil, errors.New("CaBundle secret should be 'Opaque' type")
+	}
+	caBundleVolSrc.Items = []v1.KeyToPath{
+		{Key: caBundleKeyName, Path: caBundleFileName, Mode: &userReadOnly},
+	}
+	return caBundleVolSrc, nil
+}
+
+func (c *clusterConfig) rgwTLSSecretType(secretName string) (v1.SecretType, error) {
+	rgwTlsSecret, err := c.context.Clientset.CoreV1().Secrets(c.clusterInfo.Namespace).Get(c.clusterInfo.Context, secretName, metav1.GetOptions{})
+	if rgwTlsSecret != nil {
+		return rgwTlsSecret.Type, nil
+	}
+	return "", errors.Wrapf(err, "no Kubernetes secrets referring TLS certificates found")
+}
+
+func getDaemonName(rgwConfig *rgwConfig) string {
+	return fmt.Sprintf("ceph-%s", generateCephXUser(rgwConfig.ResourceName))
 }

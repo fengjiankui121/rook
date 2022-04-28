@@ -105,7 +105,7 @@ func TestFilesystemRemove(t *testing.T) {
 			DataPools:      []int{1},
 		},
 	}
-	executor.MockExecuteCommandWithOutputFile = func(command, outputFile string, args ...string) (string, error) {
+	executor.MockExecuteCommandWithOutput = func(command string, args ...string) (string, error) {
 		logger.Infof("Command: %s %v", command, args)
 		if args[0] == "fs" {
 			if args[1] == "get" {
@@ -149,20 +149,16 @@ func TestFilesystemRemove(t *testing.T) {
 				return "", nil
 			}
 		}
-		return "", errors.Errorf("unexpected ceph command %q", args)
-	}
-	executor.MockExecuteCommandWithOutput = func(command string, args ...string) (string, error) {
 		emptyPool := "{\"images\":{\"count\":0,\"provisioned_bytes\":0,\"snap_count\":0},\"trash\":{\"count\":1,\"provisioned_bytes\":2048,\"snap_count\":0}}"
-
 		if args[0] == "pool" {
 			if args[1] == "stats" {
 				return emptyPool, nil
 			}
 		}
-		return "", errors.Errorf("unexpected rbd command %q", args)
+		return "", errors.Errorf("unexpected ceph command %q", args)
 	}
 
-	err := RemoveFilesystem(context, AdminClusterInfo("mycluster"), fs.MDSMap.FilesystemName, false)
+	err := RemoveFilesystem(context, AdminTestClusterInfo("mycluster"), fs.MDSMap.FilesystemName, false)
 	assert.Nil(t, err)
 	assert.True(t, metadataDeleted)
 	assert.True(t, dataDeleted)
@@ -196,7 +192,7 @@ func TestFailAllStandbyReplayMDS(t *testing.T) {
 			},
 		},
 	}
-	executor.MockExecuteCommandWithOutputFile = func(command, outputFile string, args ...string) (string, error) {
+	executor.MockExecuteCommandWithOutput = func(command string, args ...string) (string, error) {
 		logger.Infof("Command: %s %v", command, args)
 		if args[0] == "fs" {
 			if args[1] == "get" {
@@ -217,7 +213,7 @@ func TestFailAllStandbyReplayMDS(t *testing.T) {
 		return "", errors.Errorf("unexpected ceph command %q", args)
 	}
 
-	err := FailAllStandbyReplayMDS(context, AdminClusterInfo("mycluster"), fs.MDSMap.FilesystemName)
+	err := FailAllStandbyReplayMDS(context, AdminTestClusterInfo("mycluster"), fs.MDSMap.FilesystemName)
 	assert.NoError(t, err)
 	assert.ElementsMatch(t, failedGids, []string{"124"})
 
@@ -244,7 +240,7 @@ func TestFailAllStandbyReplayMDS(t *testing.T) {
 			},
 		},
 	}
-	executor.MockExecuteCommandWithOutputFile = func(command, outputFile string, args ...string) (string, error) {
+	executor.MockExecuteCommandWithOutput = func(command string, args ...string) (string, error) {
 		logger.Infof("Command: %s %v", command, args)
 		if args[0] == "fs" {
 			if args[1] == "get" {
@@ -263,7 +259,7 @@ func TestFailAllStandbyReplayMDS(t *testing.T) {
 		}
 		return "", errors.Errorf("unexpected ceph command %q", args)
 	}
-	err = FailAllStandbyReplayMDS(context, AdminClusterInfo("mycluster"), fs.MDSMap.FilesystemName)
+	err = FailAllStandbyReplayMDS(context, AdminTestClusterInfo("mycluster"), fs.MDSMap.FilesystemName)
 	assert.NoError(t, err)
 
 	fs = CephFilesystemDetails{
@@ -289,7 +285,7 @@ func TestFailAllStandbyReplayMDS(t *testing.T) {
 			},
 		},
 	}
-	executor.MockExecuteCommandWithOutputFile = func(command, outputFile string, args ...string) (string, error) {
+	executor.MockExecuteCommandWithOutput = func(command string, args ...string) (string, error) {
 		logger.Infof("Command: %s %v", command, args)
 		if args[0] == "fs" {
 			if args[1] == "get" {
@@ -308,7 +304,7 @@ func TestFailAllStandbyReplayMDS(t *testing.T) {
 		}
 		return "", errors.Errorf("unexpected ceph command %q", args)
 	}
-	err = FailAllStandbyReplayMDS(context, AdminClusterInfo("mycluster"), fs.MDSMap.FilesystemName)
+	err = FailAllStandbyReplayMDS(context, AdminTestClusterInfo("mycluster"), fs.MDSMap.FilesystemName)
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "expected execution of mds fail")
 }
@@ -339,7 +335,7 @@ func TestGetMdsIdByRank(t *testing.T) {
 			},
 		},
 	}
-	executor.MockExecuteCommandWithOutputFile = func(command, outputFile string, args ...string) (string, error) {
+	executor.MockExecuteCommandWithOutput = func(command string, args ...string) (string, error) {
 		logger.Infof("Command: %s %v", command, args)
 		if args[0] == "fs" {
 			if args[1] == "get" {
@@ -359,12 +355,12 @@ func TestGetMdsIdByRank(t *testing.T) {
 		return "", errors.Errorf("unexpected ceph command %q", args)
 	}
 
-	name, err := GetMdsIdByRank(context, AdminClusterInfo("mycluster"), fs.MDSMap.FilesystemName, 0)
+	name, err := GetMdsIdByRank(context, AdminTestClusterInfo("mycluster"), fs.MDSMap.FilesystemName, 0)
 	assert.Equal(t, name, "myfs1-a")
 	assert.NoError(t, err)
 
 	// test errors
-	executor.MockExecuteCommandWithOutputFile = func(command, outputFile string, args ...string) (string, error) {
+	executor.MockExecuteCommandWithOutput = func(command string, args ...string) (string, error) {
 		logger.Infof("Command: %s %v", command, args)
 		if args[0] == "fs" {
 			if args[1] == "get" {
@@ -382,7 +378,7 @@ func TestGetMdsIdByRank(t *testing.T) {
 		return "", errors.Errorf("unexpected ceph command %q", args)
 	}
 
-	name, err = GetMdsIdByRank(context, AdminClusterInfo("mycluster"), fs.MDSMap.FilesystemName, 0)
+	name, err = GetMdsIdByRank(context, AdminTestClusterInfo("mycluster"), fs.MDSMap.FilesystemName, 0)
 	assert.Equal(t, "", name)
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "test ceph fs get error")
@@ -411,7 +407,7 @@ func TestGetMdsIdByRank(t *testing.T) {
 		},
 	}
 	// test get mds by id failed error
-	executor.MockExecuteCommandWithOutputFile = func(command, outputFile string, args ...string) (string, error) {
+	executor.MockExecuteCommandWithOutput = func(command string, args ...string) (string, error) {
 		logger.Infof("Command: %s %v", command, args)
 		if args[0] == "fs" {
 			if args[1] == "get" {
@@ -431,7 +427,7 @@ func TestGetMdsIdByRank(t *testing.T) {
 		return "", errors.Errorf("unexpected ceph command %q", args)
 	}
 
-	name, err = GetMdsIdByRank(context, AdminClusterInfo("mycluster"), fs.MDSMap.FilesystemName, 0)
+	name, err = GetMdsIdByRank(context, AdminTestClusterInfo("mycluster"), fs.MDSMap.FilesystemName, 0)
 	assert.Equal(t, "", name)
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "failed to get mds gid from rank 0")
@@ -459,7 +455,7 @@ func TestGetMdsIdByRank(t *testing.T) {
 			},
 		},
 	}
-	executor.MockExecuteCommandWithOutputFile = func(command, outputFile string, args ...string) (string, error) {
+	executor.MockExecuteCommandWithOutput = func(command string, args ...string) (string, error) {
 		logger.Infof("Command: %s %v", command, args)
 		if args[0] == "fs" {
 			if args[1] == "get" {
@@ -479,7 +475,7 @@ func TestGetMdsIdByRank(t *testing.T) {
 		return "", errors.Errorf("unexpected ceph command %q", args)
 	}
 
-	name, err = GetMdsIdByRank(context, AdminClusterInfo("mycluster"), fs.MDSMap.FilesystemName, 0)
+	name, err = GetMdsIdByRank(context, AdminTestClusterInfo("mycluster"), fs.MDSMap.FilesystemName, 0)
 	assert.Equal(t, "", name)
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "failed to get mds info for rank 0")
@@ -488,7 +484,7 @@ func TestGetMdsIdByRank(t *testing.T) {
 func TestGetMDSDump(t *testing.T) {
 	executor := &exectest.MockExecutor{}
 	context := &clusterd.Context{Executor: executor}
-	executor.MockExecuteCommandWithOutputFile = func(command, outputFile string, args ...string) (string, error) {
+	executor.MockExecuteCommandWithOutput = func(command string, args ...string) (string, error) {
 		logger.Infof("Command: %s %v", command, args)
 		if args[0] == "fs" {
 			if args[1] == "dump" {
@@ -507,11 +503,11 @@ func TestGetMDSDump(t *testing.T) {
 		return "", errors.Errorf("unexpected ceph command %q", args)
 	}
 
-	mdsDump, err := GetMDSDump(context, AdminClusterInfo("mycluster"))
+	mdsDump, err := GetMDSDump(context, AdminTestClusterInfo("mycluster"))
 	assert.NoError(t, err)
 	assert.ElementsMatch(t, mdsDump.Standbys, []MDSStandBy{{Name: "rook-ceph-filesystem-b", Rank: -1}})
 
-	executor.MockExecuteCommandWithOutputFile = func(command, outputFile string, args ...string) (string, error) {
+	executor.MockExecuteCommandWithOutput = func(command string, args ...string) (string, error) {
 		logger.Infof("Command: %s %v", command, args)
 		if args[0] == "fs" {
 			if args[1] == "dump" {
@@ -521,14 +517,14 @@ func TestGetMDSDump(t *testing.T) {
 		return "", errors.Errorf("unexpected ceph command %q", args)
 	}
 
-	_, err = GetMDSDump(context, AdminClusterInfo("mycluster"))
+	_, err = GetMDSDump(context, AdminTestClusterInfo("mycluster"))
 	assert.Error(t, err)
 }
 
 func TestWaitForNoStandbys(t *testing.T) {
 	executor := &exectest.MockExecutor{}
 	context := &clusterd.Context{Executor: executor}
-	executor.MockExecuteCommandWithOutputFile = func(command, outputFile string, args ...string) (string, error) {
+	executor.MockExecuteCommandWithOutput = func(command string, args ...string) (string, error) {
 		logger.Infof("Command: %s %v", command, args)
 		if args[0] == "fs" {
 			if args[1] == "dump" {
@@ -547,10 +543,10 @@ func TestWaitForNoStandbys(t *testing.T) {
 		return "", errors.Errorf("unexpected ceph command %q", args)
 	}
 
-	err := WaitForNoStandbys(context, AdminClusterInfo("mycluster"), 6*time.Second)
+	err := WaitForNoStandbys(context, AdminTestClusterInfo("mycluster"), 6*time.Second)
 	assert.Error(t, err)
 
-	executor.MockExecuteCommandWithOutputFile = func(command, outputFile string, args ...string) (string, error) {
+	executor.MockExecuteCommandWithOutput = func(command string, args ...string) (string, error) {
 		logger.Infof("Command: %s %v", command, args)
 		if args[0] == "fs" {
 			if args[1] == "dump" {
@@ -560,11 +556,11 @@ func TestWaitForNoStandbys(t *testing.T) {
 		return "", errors.Errorf("unexpected ceph command %q", args)
 	}
 
-	err = WaitForNoStandbys(context, AdminClusterInfo("mycluster"), 6*time.Second)
+	err = WaitForNoStandbys(context, AdminTestClusterInfo("mycluster"), 6*time.Second)
 	assert.Error(t, err)
 
 	firstCall := true
-	executor.MockExecuteCommandWithOutputFile = func(command, outputFile string, args ...string) (string, error) {
+	executor.MockExecuteCommandWithOutput = func(command string, args ...string) (string, error) {
 		logger.Infof("Command: %s %v", command, args)
 		if args[0] == "fs" {
 			if args[1] == "dump" {
@@ -587,7 +583,7 @@ func TestWaitForNoStandbys(t *testing.T) {
 		}
 		return "", errors.Errorf("unexpected ceph command %q", args)
 	}
-	err = WaitForNoStandbys(context, AdminClusterInfo("mycluster"), 6*time.Second)
+	err = WaitForNoStandbys(context, AdminTestClusterInfo("mycluster"), 6*time.Second)
 	assert.NoError(t, err)
 
 }

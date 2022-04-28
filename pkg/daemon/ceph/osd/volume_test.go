@@ -17,6 +17,7 @@ limitations under the License.
 package osd
 
 import (
+	"context"
 	"fmt"
 	"io/ioutil"
 	"os"
@@ -31,6 +32,7 @@ import (
 	cephver "github.com/rook/rook/pkg/operator/ceph/version"
 	"github.com/rook/rook/pkg/operator/test"
 	exectest "github.com/rook/rook/pkg/util/exec/test"
+	"github.com/rook/rook/pkg/util/sys"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -271,6 +273,16 @@ var cephVolumeRAWTestResult = `{
 }
 `
 
+var cephVolumeRawPartitionTestResult = `{
+	"0": {
+        "ceph_fsid": "4bfe8b72-5e69-4330-b6c0-4d914db8ab89",
+        "device": "/dev/vdb1",
+        "osd_id": 0,
+        "osd_uuid": "c03d7353-96e5-4a41-98de-830dfff97d06",
+        "type": "bluestore"
+    }
+}`
+
 func createPVCAvailableDevices() *DeviceOsdMapping {
 	devices := &DeviceOsdMapping{
 		Entries: map[string]*DeviceOsdIDEntry{
@@ -312,12 +324,8 @@ func TestConfigureCVDevices(t *testing.T) {
 	}()
 
 	originalCephConfigDir := cephConfigDir
-	cephConfigDir, err = ioutil.TempDir("", "")
-	if err != nil {
-		t.Fatal(err)
-	}
+	cephConfigDir = t.TempDir()
 	defer func() {
-		os.RemoveAll(cephConfigDir)
 		cephConfigDir = originalCephConfigDir
 	}()
 
@@ -332,9 +340,6 @@ func TestConfigureCVDevices(t *testing.T) {
 	{
 		t.Log("Test case for creating new raw mode OSD on LV-backed PVC")
 		executor := &exectest.MockExecutor{}
-		executor.MockExecuteCommandWithOutputFile = func(command string, outFileArg string, args ...string) (string, error) {
-			return "{\"key\":\"mysecurekey\"}", nil
-		}
 		executor.MockExecuteCommandWithOutput = func(command string, args ...string) (string, error) {
 			logger.Infof("[MockExecuteCommandWithOutput] %s %v", command, args)
 			if command == "lsblk" && args[0] == mountedDev {
@@ -345,6 +350,9 @@ func TestConfigureCVDevices(t *testing.T) {
 			}
 			if contains(args, "lvm") && contains(args, "list") {
 				return `{}`, nil
+			}
+			if args[0] == "auth" && args[1] == "get-or-create-key" {
+				return "{\"key\":\"mysecurekey\"}", nil
 			}
 			if contains(args, "raw") && contains(args, "list") {
 				return fmt.Sprintf(`{
@@ -371,11 +379,12 @@ func TestConfigureCVDevices(t *testing.T) {
 			return "", errors.Errorf("unknown command %s %s", command, args)
 		}
 
-		context := &clusterd.Context{Executor: executor, ConfigDir: cephConfigDir}
 		clusterInfo := &cephclient.ClusterInfo{
-			CephVersion: cephver.CephVersion{Major: 14, Minor: 2, Extra: 8},
+			CephVersion: cephver.CephVersion{Major: 15, Minor: 2, Extra: 0},
 			FSID:        clusterFSID,
+			Context:     context.TODO(),
 		}
+		context := &clusterd.Context{Executor: executor, ConfigDir: cephConfigDir}
 		agent := &OsdAgent{clusterInfo: clusterInfo, nodeName: nodeName, pvcBacked: true, storeConfig: config.StoreConfig{DeviceClass: "myds"}}
 		devices := createPVCAvailableDevices()
 		deviceOSDs, err := agent.configureCVDevices(context, devices)
@@ -392,38 +401,6 @@ func TestConfigureCVDevices(t *testing.T) {
 	}
 
 	{
-		// Test case for tending to create new lvm mode OSD on LV-backed PVC, but it catches an error
-		t.Log("Test case for tending to create new lvm mode OSD on LV-backed PVC, but it catches an error")
-		executor := &exectest.MockExecutor{}
-		executor.MockExecuteCommandWithOutput = func(command string, args ...string) (string, error) {
-			logger.Infof("[MockExecuteCommandWithOutput] %s %v", command, args)
-			if command == "lsblk" && args[0] == mountedDev {
-				return fmt.Sprintf(`SIZE="17179869184" ROTA="1" RO="0" TYPE="lvm" PKNAME="" NAME="%s" KNAME="/dev/dm-1, a ...interface{})`, mapperDev), nil
-			}
-			return "", errors.Errorf("unknown command %s %s", command, args)
-		}
-		executor.MockExecuteCommandWithCombinedOutput = func(command string, args ...string) (string, error) {
-			if command == "nsenter" {
-				return "", nil
-			}
-			logger.Infof("[MockExecuteCommandWithCombinedOutput] %s %v", command, args)
-			return "", errors.Errorf("unknown command %s %s", command, args)
-		}
-
-		context := &clusterd.Context{Executor: executor, ConfigDir: cephConfigDir}
-		clusterInfo := &cephclient.ClusterInfo{
-			CephVersion: cephver.CephVersion{Major: 14, Minor: 2, Extra: 7}, // It doesn't support raw mode OSD
-			FSID:        clusterFSID,
-		}
-		agent := &OsdAgent{clusterInfo: clusterInfo, nodeName: nodeName, pvcBacked: true}
-		devices := createPVCAvailableDevices()
-
-		_, err := agent.configureCVDevices(context, devices)
-
-		assert.EqualError(t, err, "failed to initialize devices on PVC: OSD on LV-backed PVC requires new Ceph to use raw mode")
-	}
-
-	{
 		// Test case for with no available lvm mode OSD and existing raw mode OSD on LV-backed PVC, it should return info of raw mode OSD
 		t.Log("Test case for with no available lvm mode OSD and existing raw mode OSD on LV-backed PVC, it should return info of raw mode OSD")
 		executor := &exectest.MockExecutor{}
@@ -435,7 +412,7 @@ func TestConfigureCVDevices(t *testing.T) {
 			if command == "sgdisk" {
 				return "Disk identifier (GUID): 18484D7E-5287-4CE9-AC73-D02FB69055CE", nil
 			}
-			if args[1] == "ceph-volume" && args[4] == "lvm" && args[5] == "list" && args[6] == mapperDev {
+			if args[1] == "ceph-volume" && args[4] == "lvm" && args[5] == "list" {
 				return `{}`, nil
 			}
 			if args[1] == "ceph-volume" && args[4] == "raw" && args[5] == "list" && args[6] == mountedDev {
@@ -458,7 +435,7 @@ func TestConfigureCVDevices(t *testing.T) {
 
 		context := &clusterd.Context{Executor: executor, ConfigDir: cephConfigDir}
 		clusterInfo := &cephclient.ClusterInfo{
-			CephVersion: cephver.CephVersion{Major: 14, Minor: 2, Extra: 8}, // It supports raw mode OSD
+			CephVersion: cephver.CephVersion{Major: 15, Minor: 2, Extra: 0}, // It supports raw mode OSD
 			FSID:        clusterFSID,
 		}
 		agent := &OsdAgent{clusterInfo: clusterInfo, nodeName: nodeName, pvcBacked: true}
@@ -529,7 +506,7 @@ func TestConfigureCVDevices(t *testing.T) {
 
 		context := &clusterd.Context{Executor: executor, ConfigDir: cephConfigDir}
 		clusterInfo := &cephclient.ClusterInfo{
-			CephVersion: cephver.CephVersion{Major: 14, Minor: 2, Extra: 8}, // It supports raw mode OSD
+			CephVersion: cephver.CephVersion{Major: 15, Minor: 2, Extra: 0}, // It supports raw mode OSD
 			FSID:        clusterFSID,
 		}
 		agent := &OsdAgent{clusterInfo: clusterInfo, nodeName: nodeName, pvcBacked: true}
@@ -550,17 +527,16 @@ func TestConfigureCVDevices(t *testing.T) {
 	}
 
 	{
-		// Test case for a raw mode OSD
-		t.Log("Test case for a raw mode OSD")
+		t.Log("Test case for raw mode on partition")
 		executor := &exectest.MockExecutor{}
 		executor.MockExecuteCommandWithOutput = func(command string, args ...string) (string, error) {
 			logger.Infof("[MockExecuteCommandWithOutput] %s %v", command, args)
 			// get lsblk for disks from cephVolumeRAWTestResult var
-			if command == "lsblk" && (args[0] == "/dev/vdb" || args[0] == "/dev/vdc") {
-				return fmt.Sprintf(`SIZE="17179869184" ROTA="1" RO="0" TYPE="disk" PKNAME="" NAME="%s" KNAME="%s"`, args[0], args[0]), nil
+			if command == "lsblk" && (args[0] == "/dev/vdb1") {
+				return fmt.Sprintf(`SIZE="17179869184" ROTA="1" RO="0" TYPE="part" PKNAME="" NAME="%s" KNAME="%s"`, args[0], args[0]), nil
 			}
 			if args[1] == "ceph-volume" && args[4] == "raw" && args[5] == "list" {
-				return cephVolumeRAWTestResult, nil
+				return cephVolumeRawPartitionTestResult, nil
 			}
 			if args[1] == "ceph-volume" && args[4] == "lvm" && args[5] == "list" {
 				return `{}`, nil
@@ -589,13 +565,62 @@ func TestConfigureCVDevices(t *testing.T) {
 		agent := &OsdAgent{clusterInfo: clusterInfo, nodeName: nodeName, storeConfig: config.StoreConfig{DeviceClass: "myclass"}}
 		devices := &DeviceOsdMapping{
 			Entries: map[string]*DeviceOsdIDEntry{
-				"vdb": {Data: -1, Metadata: nil, Config: DesiredDevice{Name: "/dev/vdb"}},
+				"vdb1": {Data: -1, Metadata: nil, Config: DesiredDevice{Name: "/dev/vdb1"}, DeviceInfo: &sys.LocalDisk{Type: sys.PartType}},
 			},
 		}
 		_, err := agent.configureCVDevices(context, devices)
 		assert.Nil(t, err)
 		assert.True(t, deviceClassSet)
 	}
+
+	// disabled while raw mode is disabled for disks
+	// {
+	// 	// Test case for a raw mode OSD
+	// 	t.Log("Test case for a raw mode OSD")
+	// 	executor := &exectest.MockExecutor{}
+	// 	executor.MockExecuteCommandWithOutput = func(command string, args ...string) (string, error) {
+	// 		logger.Infof("[MockExecuteCommandWithOutput] %s %v", command, args)
+	// 		// get lsblk for disks from cephVolumeRAWTestResult var
+	// 		if command == "lsblk" && (args[0] == "/dev/vdb" || args[0] == "/dev/vdc") {
+	// 			return fmt.Sprintf(`SIZE="17179869184" ROTA="1" RO="0" TYPE="disk" PKNAME="" NAME="%s" KNAME="%s"`, args[0], args[0]), nil
+	// 		}
+	// 		if args[1] == "ceph-volume" && args[4] == "raw" && args[5] == "list" {
+	// 			return cephVolumeRAWTestResult, nil
+	// 		}
+	// 		if args[1] == "ceph-volume" && args[4] == "lvm" && args[5] == "list" {
+	// 			return `{}`, nil
+	// 		}
+	// 		if command == "sgdisk" {
+	// 			return "Disk identifier (GUID): 18484D7E-5287-4CE9-AC73-D02FB69055CE", nil
+	// 		}
+	// 		return "", errors.Errorf("unknown command %s %s", command, args)
+	// 	}
+	// 	deviceClassSet := false
+	// 	executor.MockExecuteCommandWithCombinedOutput = func(command string, args ...string) (string, error) {
+	// 		logger.Infof("[MockExecuteCommandWithCombinedOutput] %s %v", command, args)
+	// 		if args[1] == "ceph-volume" && args[2] == "raw" && args[3] == "prepare" && args[4] == "--bluestore" && args[7] == "--crush-device-class" {
+	// 			assert.Equal(t, "myclass", args[8])
+	// 			deviceClassSet = true
+	// 			return "", nil
+	// 		}
+	// 		return "", errors.Errorf("unknown command %s %s", command, args)
+	// 	}
+
+	// 	context := &clusterd.Context{Executor: executor, ConfigDir: cephConfigDir}
+	// 	clusterInfo := &cephclient.ClusterInfo{
+	// 		CephVersion: cephver.CephVersion{Major: 16, Minor: 2, Extra: 1}, // It supports raw mode OSD
+	// 		FSID:        clusterFSID,
+	// 	}
+	// 	agent := &OsdAgent{clusterInfo: clusterInfo, nodeName: nodeName, storeConfig: config.StoreConfig{DeviceClass: "myclass"}}
+	// 	devices := &DeviceOsdMapping{
+	// 		Entries: map[string]*DeviceOsdIDEntry{
+	// 			"vdb": {Data: -1, Metadata: nil, Config: DesiredDevice{Name: "/dev/vdb"}},
+	// 		},
+	// 	}
+	// 	_, err := agent.configureCVDevices(context, devices)
+	// 	assert.Nil(t, err)
+	// 	assert.True(t, deviceClassSet)
+	// }
 }
 
 func testBaseArgs(args []string) error {
@@ -638,7 +663,7 @@ func TestInitializeBlock(t *testing.T) {
 
 			return errors.Errorf("unknown command %s %s", command, args)
 		}
-		a := &OsdAgent{clusterInfo: &cephclient.ClusterInfo{CephVersion: cephver.CephVersion{Major: 14, Minor: 2, Extra: 8}}, nodeName: "node1"}
+		a := &OsdAgent{clusterInfo: &cephclient.ClusterInfo{CephVersion: cephver.CephVersion{Major: 15, Minor: 2, Extra: 0}}, nodeName: "node1"}
 		context := &clusterd.Context{Executor: executor}
 
 		err := a.initializeDevicesLVMMode(context, devices)
@@ -670,7 +695,7 @@ func TestInitializeBlock(t *testing.T) {
 
 			return errors.Errorf("unknown command %s %s", command, args)
 		}
-		a := &OsdAgent{clusterInfo: &cephclient.ClusterInfo{CephVersion: cephver.CephVersion{Major: 14, Minor: 2, Extra: 8}}, nodeName: "node1", storeConfig: config.StoreConfig{EncryptedDevice: true}}
+		a := &OsdAgent{clusterInfo: &cephclient.ClusterInfo{CephVersion: cephver.CephVersion{Major: 15, Minor: 2, Extra: 0}}, nodeName: "node1", storeConfig: config.StoreConfig{EncryptedDevice: true}}
 		context := &clusterd.Context{Executor: executor}
 
 		err := a.initializeDevicesLVMMode(context, devices)
@@ -702,7 +727,7 @@ func TestInitializeBlock(t *testing.T) {
 
 			return errors.Errorf("unknown command %s %s", command, args)
 		}
-		a := &OsdAgent{clusterInfo: &cephclient.ClusterInfo{CephVersion: cephver.CephVersion{Major: 14, Minor: 2, Extra: 8}}, nodeName: "node1", storeConfig: config.StoreConfig{OSDsPerDevice: 3}}
+		a := &OsdAgent{clusterInfo: &cephclient.ClusterInfo{CephVersion: cephver.CephVersion{Major: 15, Minor: 2, Extra: 0}}, nodeName: "node1", storeConfig: config.StoreConfig{OSDsPerDevice: 3}}
 		context := &clusterd.Context{Executor: executor}
 
 		err := a.initializeDevicesLVMMode(context, devices)
@@ -734,7 +759,7 @@ func TestInitializeBlock(t *testing.T) {
 
 			return errors.Errorf("unknown command %s %s", command, args)
 		}
-		a := &OsdAgent{clusterInfo: &cephclient.ClusterInfo{CephVersion: cephver.CephVersion{Major: 14, Minor: 2, Extra: 8}}, nodeName: "node1", storeConfig: config.StoreConfig{DeviceClass: "hybrid"}}
+		a := &OsdAgent{clusterInfo: &cephclient.ClusterInfo{CephVersion: cephver.CephVersion{Major: 15, Minor: 2, Extra: 0}}, nodeName: "node1", storeConfig: config.StoreConfig{DeviceClass: "hybrid"}}
 		context := &clusterd.Context{Executor: executor}
 		err := a.initializeDevicesLVMMode(context, devices)
 		assert.NoError(t, err, "failed crush device class test")
@@ -788,7 +813,7 @@ func TestInitializeBlock(t *testing.T) {
 
 			return "", errors.Errorf("unknown command %s %s", command, args)
 		}
-		a := &OsdAgent{clusterInfo: &cephclient.ClusterInfo{CephVersion: cephver.CephVersion{Major: 14, Minor: 2, Extra: 8}}, nodeName: "node1"}
+		a := &OsdAgent{clusterInfo: &cephclient.ClusterInfo{CephVersion: cephver.CephVersion{Major: 15, Minor: 2, Extra: 0}}, nodeName: "node1"}
 		context := &clusterd.Context{Executor: executor}
 
 		err := a.initializeDevicesLVMMode(context, devices)
@@ -843,7 +868,7 @@ func TestInitializeBlock(t *testing.T) {
 
 			return "", errors.Errorf("unknown command %s %s", command, args)
 		}
-		a := &OsdAgent{clusterInfo: &cephclient.ClusterInfo{CephVersion: cephver.CephVersion{Major: 14, Minor: 2, Extra: 8}}, nodeName: "node1"}
+		a := &OsdAgent{clusterInfo: &cephclient.ClusterInfo{CephVersion: cephver.CephVersion{Major: 15, Minor: 2, Extra: 0}}, nodeName: "node1"}
 		context := &clusterd.Context{Executor: executor}
 
 		err := a.initializeDevicesLVMMode(context, devices)
@@ -863,10 +888,10 @@ func TestInitializeBlockPVC(t *testing.T) {
 		return "", errors.Errorf("unknown command %s %s", command, args)
 	}
 
-	// Test with CephVersion{Major: 14, Minor: 2, Extra: 8} for argument raw  without flag --crush-device-class.
+	// Test for argument raw  without flag --crush-device-class.
 	context := &clusterd.Context{Executor: executor}
 	clusterInfo := &cephclient.ClusterInfo{
-		CephVersion: cephver.CephVersion{Major: 14, Minor: 2, Extra: 8},
+		CephVersion: cephver.CephVersion{Major: 15, Minor: 2, Extra: 0},
 	}
 	a := &OsdAgent{clusterInfo: clusterInfo, nodeName: "node1"}
 	devices := &DeviceOsdMapping{
@@ -881,82 +906,6 @@ func TestInitializeBlockPVC(t *testing.T) {
 	assert.Equal(t, "", metadataBlockPath)
 	assert.Equal(t, "", walBlockPath)
 
-	// Test for failure scenario by giving CephVersion{Major: 14, Minor: 2, Extra: 7}
-	// instead of CephVersion{Major: 14, Minor: 2, Extra: 8}.
-	clusterInfo = &cephclient.ClusterInfo{
-		CephVersion: cephver.CephVersion{Major: 14, Minor: 2, Extra: 7},
-	}
-	a = &OsdAgent{clusterInfo: clusterInfo, nodeName: "node1"}
-	devices = &DeviceOsdMapping{
-		Entries: map[string]*DeviceOsdIDEntry{
-			"data": {Data: -1, Metadata: nil, Config: DesiredDevice{Name: "/mnt/set1-data-0-rpf2k"}},
-		},
-	}
-
-	_, _, _, err = a.initializeBlockPVC(context, devices, false)
-	assert.NotNil(t, err)
-
-	executor.MockExecuteCommandWithCombinedOutput = func(command string, args ...string) (string, error) {
-		logger.Infof("%s %v", command, args)
-		if args[1] == "ceph-volume" && args[2] == "lvm" && args[3] == "prepare" && args[4] == "--bluestore" {
-			return initializeBlockPVCTestResult, nil
-		}
-
-		return "", errors.Errorf("unknown command %s %s", command, args)
-	}
-
-	// Test with CephVersion{Major: 14, Minor: 2, Extra: 7} for argument lvm  without flag --crush-device-class.
-	clusterInfo = &cephclient.ClusterInfo{
-		CephVersion: cephver.CephVersion{Major: 14, Minor: 2, Extra: 7},
-	}
-	a = &OsdAgent{clusterInfo: clusterInfo, nodeName: "node1"}
-	devices = &DeviceOsdMapping{
-		Entries: map[string]*DeviceOsdIDEntry{
-			"data": {Data: -1, Metadata: nil, Config: DesiredDevice{Name: "/mnt/set1-data-0-rpf2k"}},
-		},
-	}
-
-	blockPath, metadataBlockPath, walBlockPath, err = a.initializeBlockPVC(context, devices, false)
-	assert.Nil(t, err)
-	assert.Equal(t, "/dev/ceph-bceae560-85b1-4a87-9375-6335fb760c8c/osd-block-2ac8edb0-0d2e-4d8f-a6cc-4c972d56079c", blockPath)
-	assert.Equal(t, "", metadataBlockPath)
-	assert.Equal(t, "", walBlockPath)
-
-	// Test for failure scenario by giving CephVersion{Major: 14, Minor: 2, Extra: 8}
-	// instead of cephver.CephVersion{Major: 14, Minor: 2, Extra: 7}.
-	clusterInfo = &cephclient.ClusterInfo{
-		CephVersion: cephver.CephVersion{Major: 14, Minor: 2, Extra: 8},
-	}
-	a = &OsdAgent{clusterInfo: clusterInfo, nodeName: "node1"}
-	devices = &DeviceOsdMapping{
-		Entries: map[string]*DeviceOsdIDEntry{
-			"data": {Data: -1, Metadata: nil, Config: DesiredDevice{Name: "/mnt/set1-data-0-rpf2k"}},
-		},
-	}
-
-	_, _, _, err = a.initializeBlockPVC(context, devices, false)
-	assert.NotNil(t, err)
-
-	// Test for OSD on LV-backed PVC where Ceph does not support raw mode.
-	// Expect no commands to be used.
-	executor.MockExecuteCommandWithCombinedOutput = func(command string, args ...string) (string, error) {
-		logger.Infof("%s %v", command, args)
-		return "", errors.Errorf("unknown command %s %s", command, args)
-	}
-	// Test with CephVersion{Major: 14, Minor: 2, Extra: 7}
-	clusterInfo = &cephclient.ClusterInfo{
-		CephVersion: cephver.CephVersion{Major: 14, Minor: 2, Extra: 7},
-	}
-	a = &OsdAgent{clusterInfo: clusterInfo, nodeName: "node1"}
-	devices = &DeviceOsdMapping{
-		Entries: map[string]*DeviceOsdIDEntry{
-			"data": {Data: -1, Metadata: nil, Config: DesiredDevice{Name: "/mnt/set1-data-0-rpf2k"}},
-		},
-	}
-	_, _, _, err = a.initializeBlockPVC(context, devices, true)
-	assert.NotNil(t, err)
-	logger.Infof("error message %v", err)
-
 	executor.MockExecuteCommandWithCombinedOutput = func(command string, args ...string) (string, error) {
 		logger.Infof("%s %v", command, args)
 		if args[1] == "ceph-volume" && args[2] == "raw" && args[3] == "prepare" && args[4] == "--bluestore" && args[7] == "--crush-device-class" {
@@ -966,11 +915,11 @@ func TestInitializeBlockPVC(t *testing.T) {
 
 		return "", errors.Errorf("unknown command %s %s", command, args)
 	}
-	// Test with CephVersion{Major: 14, Minor: 2, Extra: 8} for argument raw  with flag --crush-device-class.
+	// Test with flag --crush-device-class.
 	os.Setenv(oposd.CrushDeviceClassVarName, "foo")
 	defer os.Unsetenv(oposd.CrushDeviceClassVarName)
 	clusterInfo = &cephclient.ClusterInfo{
-		CephVersion: cephver.CephVersion{Major: 14, Minor: 2, Extra: 8},
+		CephVersion: cephver.CephVersion{Major: 15, Minor: 2, Extra: 0},
 	}
 	a = &OsdAgent{clusterInfo: clusterInfo, nodeName: "node1"}
 	devices = &DeviceOsdMapping{
@@ -985,7 +934,7 @@ func TestInitializeBlockPVC(t *testing.T) {
 	assert.Equal(t, "", metadataBlockPath)
 	assert.Equal(t, "", walBlockPath)
 
-	// Test for condition when Data !=-1 with CephVersion{Major: 14, Minor: 2, Extra: 8} for raw  with flag --crush-device-class.
+	// Test for condition when Data !=-1 with flag --crush-device-class.
 	devices = &DeviceOsdMapping{
 		Entries: map[string]*DeviceOsdIDEntry{
 			"data": {Data: 0, Metadata: nil, Config: DesiredDevice{Name: "/mnt/set1-data-0-rpf2k"}},
@@ -1009,10 +958,10 @@ func TestInitializeBlockPVCWithMetadata(t *testing.T) {
 		return "", errors.Errorf("unknown command %s %s", command, args)
 	}
 
-	// Test with CephVersion{Major: 14, Minor: 2, Extra: 8} for argument raw with flag --block.db and without --crush-device-class flag.
+	// Test with flag --block.db and without --crush-device-class flag.
 	context := &clusterd.Context{Executor: executor}
 	clusterInfo := &cephclient.ClusterInfo{
-		CephVersion: cephver.CephVersion{Major: 14, Minor: 2, Extra: 8},
+		CephVersion: cephver.CephVersion{Major: 15, Minor: 2, Extra: 0},
 	}
 	a := &OsdAgent{clusterInfo: clusterInfo, nodeName: "node1"}
 
@@ -1032,34 +981,6 @@ func TestInitializeBlockPVCWithMetadata(t *testing.T) {
 
 	executor.MockExecuteCommandWithCombinedOutput = func(command string, args ...string) (string, error) {
 		logger.Infof("%s %v", command, args)
-		if args[1] == "ceph-volume" && args[2] == "lvm" && args[3] == "prepare" && args[4] == "--bluestore" && args[7] == "--block.db" {
-			return initializeBlockPVCTestResult, nil
-		}
-		return "", errors.Errorf("unknown command %s %s", command, args)
-	}
-
-	// Test with CephVersion{Major: 14, Minor: 2, Extra: 7} for argument lvm with flag --block.db and without --crush-device-class  flag.
-	clusterInfo = &cephclient.ClusterInfo{
-		CephVersion: cephver.CephVersion{Major: 14, Minor: 2, Extra: 7},
-	}
-	a = &OsdAgent{clusterInfo: clusterInfo, nodeName: "node1"}
-
-	devices = &DeviceOsdMapping{
-		Entries: map[string]*DeviceOsdIDEntry{
-			"data":     {Data: -1, Metadata: nil, Config: DesiredDevice{Name: "/mnt/set1-data-0-rpf2k"}},
-			"metadata": {Data: 0, Metadata: []int{1}, Config: DesiredDevice{Name: "/srv/set1-metadata-0-8c7kr"}},
-			"wal":      {Data: 1, Metadata: []int{2}, Config: DesiredDevice{Name: ""}},
-		},
-	}
-
-	blockPath, metadataBlockPath, walBlockPath, err = a.initializeBlockPVC(context, devices, false)
-	assert.Nil(t, err)
-	assert.Equal(t, "/dev/ceph-bceae560-85b1-4a87-9375-6335fb760c8c/osd-block-2ac8edb0-0d2e-4d8f-a6cc-4c972d56079c", blockPath)
-	assert.Equal(t, "/srv/set1-metadata-0-8c7kr", metadataBlockPath)
-	assert.Equal(t, "", walBlockPath)
-
-	executor.MockExecuteCommandWithCombinedOutput = func(command string, args ...string) (string, error) {
-		logger.Infof("%s %v", command, args)
 		if args[1] == "ceph-volume" && args[2] == "raw" && args[3] == "prepare" && args[4] == "--bluestore" && args[7] == "--crush-device-class" && args[9] == "--block.db" {
 			return initializeBlockPVCTestResult, nil
 		}
@@ -1067,12 +988,12 @@ func TestInitializeBlockPVCWithMetadata(t *testing.T) {
 		return "", errors.Errorf("unknown command %s %s", command, args)
 	}
 
-	// Test with CephVersion{Major: 14, Minor: 2, Extra: 8} for argument raw with flag --block.db and --crush-device-class  flag.
+	// Test with flag --block.db and --crush-device-class flag.
 	os.Setenv(oposd.CrushDeviceClassVarName, "foo")
 	defer os.Unsetenv(oposd.CrushDeviceClassVarName)
 	context = &clusterd.Context{Executor: executor}
 	clusterInfo = &cephclient.ClusterInfo{
-		CephVersion: cephver.CephVersion{Major: 14, Minor: 2, Extra: 8},
+		CephVersion: cephver.CephVersion{Major: 15, Minor: 2, Extra: 0},
 	}
 	a = &OsdAgent{clusterInfo: clusterInfo, nodeName: "node1"}
 
@@ -1267,22 +1188,21 @@ Running command: /usr/bin/ceph --cluster ceph --name client.bootstrap-osd --keyr
 }
 
 func TestIsNewStyledLvmBatch(t *testing.T) {
-	newStyleLvmBatchVersion := cephver.CephVersion{Major: 14, Minor: 2, Extra: 15}
-	legacyLvmBatchVersion := cephver.CephVersion{Major: 14, Minor: 2, Extra: 8}
+	newStyleLvmBatchVersion := cephver.CephVersion{Major: 15, Minor: 2, Extra: 15}
+	legacyLvmBatchVersion := cephver.CephVersion{Major: 15, Minor: 2, Extra: 0}
 	assert.Equal(t, true, isNewStyledLvmBatch(newStyleLvmBatchVersion))
 	assert.Equal(t, false, isNewStyledLvmBatch(legacyLvmBatchVersion))
 }
 
 func TestInitializeBlockWithMD(t *testing.T) {
-	// Common vars for all the tests
-	devices := &DeviceOsdMapping{
-		Entries: map[string]*DeviceOsdIDEntry{
-			"sda": {Data: -1, Metadata: nil, Config: DesiredDevice{Name: "/dev/sda", MetadataDevice: "/dev/sdd"}},
-		},
-	}
-
 	// Test default behavior
 	{
+		devices := &DeviceOsdMapping{
+			Entries: map[string]*DeviceOsdIDEntry{
+				"sda": {Data: -1, Metadata: nil, Config: DesiredDevice{Name: "/dev/sda", MetadataDevice: "/dev/sdd"}},
+			},
+		}
+
 		executor := &exectest.MockExecutor{}
 		executor.MockExecuteCommand = func(command string, args ...string) error {
 			logger.Infof("%s %v", command, args)
@@ -1308,20 +1228,59 @@ func TestInitializeBlockWithMD(t *testing.T) {
 
 			return "", errors.Errorf("unknown command %s %s", command, args)
 		}
-		a := &OsdAgent{clusterInfo: &cephclient.ClusterInfo{CephVersion: cephver.CephVersion{Major: 14, Minor: 2, Extra: 15}}, nodeName: "node1"}
+		a := &OsdAgent{clusterInfo: &cephclient.ClusterInfo{CephVersion: cephver.CephVersion{Major: 15, Minor: 2, Extra: 10}}, nodeName: "node1"}
 		context := &clusterd.Context{Executor: executor}
 
 		err := a.initializeDevicesLVMMode(context, devices)
 		assert.NoError(t, err, "failed default behavior test")
 	}
+
+	// Test initialize with LV as metadata devices
+	{
+		devices := &DeviceOsdMapping{
+			Entries: map[string]*DeviceOsdIDEntry{
+				"sda": {Data: -1, Metadata: nil, Config: DesiredDevice{Name: "/dev/sda", MetadataDevice: "vg0/lv0"}},
+			},
+		}
+		executor := &exectest.MockExecutor{}
+		executor.MockExecuteCommand = func(command string, args ...string) error {
+			logger.Infof("%s %v", command, args)
+
+			// Validate base common args
+			err := testBaseArgs(args)
+			if err != nil {
+				return err
+			}
+
+			// Second command
+			if args[9] == "--osds-per-device" && args[10] == "1" && args[11] == "/dev/sda" && args[12] == "--db-devices" && args[13] == "/dev/vg0/lv0" {
+				return nil
+			}
+
+			return errors.Errorf("unknown command %s %s", command, args)
+		}
+		executor.MockExecuteCommandWithOutput = func(command string, args ...string) (string, error) {
+			// First command
+			if args[9] == "--osds-per-device" && args[10] == "1" && args[11] == "/dev/sda" && args[12] == "--db-devices" && args[13] == "/dev/vg0/lv0" && args[14] == "--report" {
+				return `[{"block_db": "vg0/lv0", "encryption": "None", "data": "/dev/sda", "data_size": "100.00 GB", "block_db_size": "10.00 GB"}]`, nil
+			}
+
+			return "", errors.Errorf("unknown command %s %s", command, args)
+		}
+		a := &OsdAgent{clusterInfo: &cephclient.ClusterInfo{CephVersion: cephver.CephVersion{Major: 16, Minor: 2, Extra: 4}}, nodeName: "node1"}
+		context := &clusterd.Context{Executor: executor}
+
+		err := a.initializeDevicesLVMMode(context, devices)
+		assert.NoError(t, err, "failed LV as metadataDevice test")
+	}
+
 }
 
-func TestUseRawMode(t *testing.T) {
+func TestAllowRawMode(t *testing.T) {
 	type fields struct {
 		clusterInfo    *cephclient.ClusterInfo
 		metadataDevice string
 		storeConfig    config.StoreConfig
-		pvcBacked      bool
 	}
 	type args struct {
 		context   *clusterd.Context
@@ -1334,20 +1293,13 @@ func TestUseRawMode(t *testing.T) {
 		want    bool
 		wantErr bool
 	}{
-		{"on pvc with lvm", fields{&cephclient.ClusterInfo{CephVersion: cephver.CephVersion{Major: 14, Minor: 2, Extra: 5}}, "", config.StoreConfig{}, true}, args{&clusterd.Context{}, true}, false, false},
-		{"on pvc with raw", fields{&cephclient.ClusterInfo{CephVersion: cephver.CephVersion{Major: 14, Minor: 2, Extra: 8}}, "", config.StoreConfig{}, true}, args{&clusterd.Context{}, true}, true, false},
-		{"non-pvc with lvm nautilus", fields{&cephclient.ClusterInfo{CephVersion: cephver.CephVersion{Major: 14, Minor: 2, Extra: 13}}, "", config.StoreConfig{}, false}, args{&clusterd.Context{}, false}, false, false},
-		{"non-pvc with lvm octopus", fields{&cephclient.ClusterInfo{CephVersion: cephver.CephVersion{Major: 15, Minor: 2, Extra: 8}}, "", config.StoreConfig{}, false}, args{&clusterd.Context{}, false}, false, false},
-		{"non-pvc with raw nautilus simple scenario supported", fields{&cephclient.ClusterInfo{CephVersion: cephver.CephVersion{Major: 14, Minor: 2, Extra: 14}}, "", config.StoreConfig{}, false}, args{&clusterd.Context{}, false}, true, false},
-		{"non-pvc with raw octopus simple scenario supported", fields{&cephclient.ClusterInfo{CephVersion: cephver.CephVersion{Major: 15, Minor: 2, Extra: 9}}, "", config.StoreConfig{}, false}, args{&clusterd.Context{}, false}, true, false},
-		{"non-pvc with raw pacific simple scenario supported", fields{&cephclient.ClusterInfo{CephVersion: cephver.CephVersion{Major: 16, Minor: 2, Extra: 1}}, "", config.StoreConfig{}, false}, args{&clusterd.Context{}, false}, true, false},
-		{"non-pvc with lvm nautilus complex scenario not supported: encrypted", fields{&cephclient.ClusterInfo{CephVersion: cephver.CephVersion{Major: 14, Minor: 2, Extra: 14}}, "", config.StoreConfig{EncryptedDevice: true}, false}, args{&clusterd.Context{}, false}, false, false},
-		{"non-pvc with lvm octopus complex scenario not supported: encrypted", fields{&cephclient.ClusterInfo{CephVersion: cephver.CephVersion{Major: 15, Minor: 2, Extra: 9}}, "", config.StoreConfig{EncryptedDevice: true}, false}, args{&clusterd.Context{}, false}, false, false},
-		{"non-pvc with lvm nautilus complex scenario not supported: osd per device > 1", fields{&cephclient.ClusterInfo{CephVersion: cephver.CephVersion{Major: 14, Minor: 2, Extra: 14}}, "", config.StoreConfig{OSDsPerDevice: 2}, false}, args{&clusterd.Context{}, false}, false, false},
-		{"non-pvc with lvm octopus complex scenario not supported: osd per device > 1", fields{&cephclient.ClusterInfo{CephVersion: cephver.CephVersion{Major: 15, Minor: 2, Extra: 9}}, "", config.StoreConfig{OSDsPerDevice: 2}, false}, args{&clusterd.Context{}, false}, false, false},
-		{"non-pvc with lvm nautilus complex scenario not supported: metadata dev", fields{&cephclient.ClusterInfo{CephVersion: cephver.CephVersion{Major: 14, Minor: 2, Extra: 14}}, "/dev/sdb", config.StoreConfig{}, false}, args{&clusterd.Context{}, false}, false, false},
-		{"non-pvc with lvm octopus complex scenario not supported: metadata dev", fields{&cephclient.ClusterInfo{CephVersion: cephver.CephVersion{Major: 15, Minor: 2, Extra: 9}}, "/dev/sdb", config.StoreConfig{}, false}, args{&clusterd.Context{}, false}, false, false},
-		{"non-pvc with lvm pacific complex scenario not supported: metadata dev", fields{&cephclient.ClusterInfo{CephVersion: cephver.CephVersion{Major: 16, Minor: 2, Extra: 1}}, "/dev/sdb", config.StoreConfig{}, false}, args{&clusterd.Context{}, false}, false, false},
+		{"lvm octopus", fields{&cephclient.ClusterInfo{CephVersion: cephver.CephVersion{Major: 15, Minor: 2, Extra: 8}}, "", config.StoreConfig{}}, args{&clusterd.Context{}, false}, false, false},
+		{"raw octopus simple scenario supported", fields{&cephclient.ClusterInfo{CephVersion: cephver.CephVersion{Major: 15, Minor: 2, Extra: 9}}, "", config.StoreConfig{}}, args{&clusterd.Context{}, false}, true, false},
+		{"raw pacific simple scenario supported", fields{&cephclient.ClusterInfo{CephVersion: cephver.CephVersion{Major: 16, Minor: 2, Extra: 1}}, "", config.StoreConfig{}}, args{&clusterd.Context{}, false}, true, false},
+		{"lvm octopus complex scenario not supported: encrypted", fields{&cephclient.ClusterInfo{CephVersion: cephver.CephVersion{Major: 15, Minor: 2, Extra: 9}}, "", config.StoreConfig{EncryptedDevice: true}}, args{&clusterd.Context{}, false}, false, false},
+		{"lvm octopus complex scenario not supported: osd per device > 1", fields{&cephclient.ClusterInfo{CephVersion: cephver.CephVersion{Major: 15, Minor: 2, Extra: 9}}, "", config.StoreConfig{OSDsPerDevice: 2}}, args{&clusterd.Context{}, false}, false, false},
+		{"lvm octopus complex scenario not supported: metadata dev", fields{&cephclient.ClusterInfo{CephVersion: cephver.CephVersion{Major: 15, Minor: 2, Extra: 9}}, "/dev/sdb", config.StoreConfig{}}, args{&clusterd.Context{}, false}, false, false},
+		{"lvm pacific complex scenario not supported: metadata dev", fields{&cephclient.ClusterInfo{CephVersion: cephver.CephVersion{Major: 16, Minor: 2, Extra: 1}}, "/dev/sdb", config.StoreConfig{}}, args{&clusterd.Context{}, false}, false, false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -1355,15 +1307,14 @@ func TestUseRawMode(t *testing.T) {
 				clusterInfo:    tt.fields.clusterInfo,
 				metadataDevice: tt.fields.metadataDevice,
 				storeConfig:    tt.fields.storeConfig,
-				pvcBacked:      tt.fields.pvcBacked,
 			}
-			got, err := a.useRawMode(tt.args.context, tt.args.pvcBacked)
+			got, err := a.allowRawMode(tt.args.context)
 			if (err != nil) != tt.wantErr {
-				t.Errorf("OsdAgent.useRawMode() error = %v, wantErr %v", err, tt.wantErr)
+				t.Errorf("OsdAgent.allowRawMode() error = %v, wantErr %v", err, tt.wantErr)
 				return
 			}
 			if got != tt.want {
-				t.Errorf("OsdAgent.useRawMode() = %v, want %v", got, tt.want)
+				t.Errorf("OsdAgent.allowRawMode() = %v, want %v", got, tt.want)
 			}
 		})
 	}
@@ -1422,4 +1373,68 @@ func TestAppendOSDInfo(t *testing.T) {
 		trimmedOSDs := appendOSDInfo(currentOSDs, newOSDs)
 		assert.Equal(t, 3, len(trimmedOSDs))
 	}
+}
+
+func TestIsSafeToUseRawMode(t *testing.T) {
+	baseDisk := func() *DeviceOsdIDEntry {
+		return &DeviceOsdIDEntry{
+			Config: DesiredDevice{
+				Name: "vda",
+			},
+			DeviceInfo: &sys.LocalDisk{
+				Name: "vda",
+				Type: sys.DiskType,
+			},
+		}
+	}
+	basePart := func() *DeviceOsdIDEntry {
+		return &DeviceOsdIDEntry{
+			Config: DesiredDevice{
+				Name: "vda1",
+			},
+			DeviceInfo: &sys.LocalDisk{
+				Name: "vda1",
+				Type: sys.PartType,
+			},
+		}
+	}
+
+	cephPrevMajor := cephver.CephVersion{Major: 15, Minor: 2, Extra: 15}
+	cephBeforeAtariPatch := cephver.CephVersion{Major: 16, Minor: 2, Extra: 5}
+	cephWithAtariPatch := cephver.CephVersion{Major: 16, Minor: 2, Extra: 6}
+	cephNextMajor := cephver.CephVersion{Major: 17, Minor: 2, Extra: 0}
+
+	t.Run("safe for partitions with all Ceph versions", func(t *testing.T) {
+		device := basePart()
+		assert.True(t, isSafeToUseRawMode(device, cephPrevMajor))
+		assert.True(t, isSafeToUseRawMode(device, cephBeforeAtariPatch))
+		assert.True(t, isSafeToUseRawMode(device, cephWithAtariPatch))
+		assert.True(t, isSafeToUseRawMode(device, cephNextMajor))
+	})
+
+	t.Run("safe for disks only with atari patch", func(t *testing.T) {
+		device := baseDisk()
+		// make sure it's still unsafe for previous ceph version
+		assert.False(t, isSafeToUseRawMode(device, cephPrevMajor))
+		assert.False(t, isSafeToUseRawMode(device, cephBeforeAtariPatch))
+		assert.True(t, isSafeToUseRawMode(device, cephWithAtariPatch))
+		// make sure it's still safe when next ceph version comes out
+		assert.True(t, isSafeToUseRawMode(device, cephNextMajor))
+	})
+
+	t.Run("not safe if OSDs per device > 1", func(t *testing.T) {
+		device := baseDisk()
+		device.Config.OSDsPerDevice = 2
+		// we only care about the cases where disks would otherwise be safe
+		assert.False(t, isSafeToUseRawMode(device, cephWithAtariPatch))
+		assert.False(t, isSafeToUseRawMode(device, cephNextMajor))
+	})
+
+	t.Run("not safe if metadata device specified", func(t *testing.T) {
+		device := baseDisk()
+		device.Config.MetadataDevice = "vdb1"
+		// we only care about the cases where disks would otherwise be safe
+		assert.False(t, isSafeToUseRawMode(device, cephWithAtariPatch))
+		assert.False(t, isSafeToUseRawMode(device, cephNextMajor))
+	})
 }

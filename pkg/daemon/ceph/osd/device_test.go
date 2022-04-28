@@ -17,7 +17,6 @@ package osd
 
 import (
 	"io/ioutil"
-	"os"
 	"path"
 	"strings"
 	"testing"
@@ -29,18 +28,16 @@ import (
 )
 
 func TestOSDBootstrap(t *testing.T) {
-	configDir, _ := ioutil.TempDir("", "")
-	defer os.RemoveAll(configDir)
+	configDir := t.TempDir()
 
 	executor := &exectest.MockExecutor{
-		MockExecuteCommandWithOutputFile: func(command string, outFileArg string, args ...string) (string, error) {
+		MockExecuteCommandWithOutput: func(command string, args ...string) (string, error) {
 			return "{\"key\":\"mysecurekey\"}", nil
 		},
 	}
 
 	context := &clusterd.Context{Executor: executor, ConfigDir: configDir}
-	defer os.RemoveAll(context.ConfigDir)
-	err := createOSDBootstrapKeyring(context, &client.ClusterInfo{Namespace: "name"}, configDir)
+	err := createOSDBootstrapKeyring(context, client.AdminTestClusterInfo("mycluster"), configDir)
 	assert.Nil(t, err)
 
 	targetPath := path.Join(configDir, bootstrapOsdKeyring)

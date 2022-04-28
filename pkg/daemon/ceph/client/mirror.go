@@ -17,37 +17,59 @@ limitations under the License.
 package client
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
 	"os"
+	"strings"
 
 	"github.com/pkg/errors"
 	cephv1 "github.com/rook/rook/pkg/apis/ceph.rook.io/v1"
 	"github.com/rook/rook/pkg/clusterd"
+	"k8s.io/apimachinery/pkg/util/sets"
+)
+
+// PeerToken is the content of the peer token
+type PeerToken struct {
+	ClusterFSID string `json:"fsid"`
+	ClientID    string `json:"client_id"`
+	Key         string `json:"key"`
+	MonHost     string `json:"mon_host"`
+	// These fields are added by Rook and NOT part of the output of client.CreateRBDMirrorBootstrapPeer()
+	Namespace string `json:"namespace"`
+}
+
+var (
+	rbdMirrorPeerCaps      = []string{"mon", "profile rbd-mirror-peer", "osd", "profile rbd"}
+	rbdMirrorPeerKeyringID = "rbd-mirror-peer"
 )
 
 // ImportRBDMirrorBootstrapPeer add a mirror peer in the rbd-mirror configuration
-func ImportRBDMirrorBootstrapPeer(context *clusterd.Context, clusterInfo *ClusterInfo, poolName, direction string, token []byte) error {
+func ImportRBDMirrorBootstrapPeer(context *clusterd.Context, clusterInfo *ClusterInfo, poolName string, direction string, token []byte) error {
 	logger.Infof("add rbd-mirror bootstrap peer token for pool %q", poolName)
 
 	// Token file
-	tokenFilePath := fmt.Sprintf("/tmp/rbd-mirror-token-%s", poolName)
+	tokenFilePattern := fmt.Sprintf("rbd-mirror-token-%s", poolName)
+	tokenFilePath, err := ioutil.TempFile("/tmp", tokenFilePattern)
+	if err != nil {
+		return errors.Wrapf(err, "failed to create temporary token file for pool %q", poolName)
+	}
 
 	// Write token into a file
-	err := ioutil.WriteFile(tokenFilePath, token, 0400)
+	err = ioutil.WriteFile(tokenFilePath.Name(), token, 0400)
 	if err != nil {
-		return errors.Wrapf(err, "failed to write token to file %q", tokenFilePath)
+		return errors.Wrapf(err, "failed to write token to file %q", tokenFilePath.Name())
 	}
 
 	// Remove token once we exit, we don't need it anymore
 	defer func() error {
-		err := os.Remove(tokenFilePath)
+		err := os.Remove(tokenFilePath.Name())
 		return err
-	}() //nolint, we don't want to return here
+	}() //nolint // we don't want to return here
 
 	// Build command
-	args := []string{"mirror", "pool", "peer", "bootstrap", "import", poolName, tokenFilePath}
+	args := []string{"mirror", "pool", "peer", "bootstrap", "import", poolName, tokenFilePath.Name()}
 	if direction != "" {
 		args = append(args, "--direction", direction)
 	}
@@ -59,6 +81,7 @@ func ImportRBDMirrorBootstrapPeer(context *clusterd.Context, clusterInfo *Cluste
 		return errors.Wrapf(err, "failed to add rbd-mirror peer token for pool %q. %s", poolName, output)
 	}
 
+	logger.Infof("successfully added rbd-mirror peer token for pool %q", poolName)
 	return nil
 }
 
@@ -73,7 +96,7 @@ func CreateRBDMirrorBootstrapPeer(context *clusterd.Context, clusterInfo *Cluste
 	// Run command
 	output, err := cmd.Run()
 	if err != nil {
-		return nil, errors.Wrapf(err, "failed to create rbd-mirror peer token  for pool %q. %s", poolName, output)
+		return nil, errors.Wrapf(err, "failed to create rbd-mirror peer token for pool %q. %s", poolName, output)
 	}
 
 	logger.Infof("successfully created rbd-mirror bootstrap peer token for pool %q", poolName)
@@ -81,17 +104,50 @@ func CreateRBDMirrorBootstrapPeer(context *clusterd.Context, clusterInfo *Cluste
 }
 
 // enablePoolMirroring turns on mirroring on that pool by specifying the mirroring type
-func enablePoolMirroring(context *clusterd.Context, clusterInfo *ClusterInfo, pool cephv1.PoolSpec, poolName string) error {
-	logger.Infof("enabling mirroring type %q for pool %q", pool.Mirroring.Mode, poolName)
+func enablePoolMirroring(context *clusterd.Context, clusterInfo *ClusterInfo, pool cephv1.NamedPoolSpec) error {
+	logger.Infof("enabling mirroring type %q for pool %q", pool.Mirroring.Mode, pool.Name)
 
 	// Build command
-	args := []string{"mirror", "pool", "enable", poolName, pool.Mirroring.Mode}
+	args := []string{"mirror", "pool", "enable", pool.Name, pool.Mirroring.Mode}
 	cmd := NewRBDCommand(context, clusterInfo, args)
 
 	// Run command
 	output, err := cmd.Run()
 	if err != nil {
-		return errors.Wrapf(err, "failed to enable mirroring type %q for pool %q. %s", pool.Mirroring.Mode, poolName, output)
+		return errors.Wrapf(err, "failed to enable mirroring type %q for pool %q. %s", pool.Mirroring.Mode, pool.Name, output)
+	}
+
+	return nil
+}
+
+// disablePoolMirroring turns off mirroring on a pool
+func disablePoolMirroring(context *clusterd.Context, clusterInfo *ClusterInfo, poolName string) error {
+	logger.Infof("disabling mirroring for pool %q", poolName)
+
+	// Build command
+	args := []string{"mirror", "pool", "disable", poolName}
+	cmd := NewRBDCommand(context, clusterInfo, args)
+
+	// Run command
+	output, err := cmd.Run()
+	if err != nil {
+		return errors.Wrapf(err, "failed to disable mirroring for pool %q. %s", poolName, output)
+	}
+
+	return nil
+}
+
+func removeClusterPeer(context *clusterd.Context, clusterInfo *ClusterInfo, poolName, peerUUID string) error {
+	logger.Infof("removing cluster peer with UUID %q for the pool %q", peerUUID, poolName)
+
+	// Build command
+	args := []string{"mirror", "pool", "peer", "remove", poolName, peerUUID}
+	cmd := NewRBDCommand(context, clusterInfo, args)
+
+	// Run command
+	output, err := cmd.Run()
+	if err != nil {
+		return errors.Wrapf(err, "failed to remove cluster peer with UUID %q for the pool %q. %s", peerUUID, poolName, output)
 	}
 
 	return nil
@@ -190,17 +246,17 @@ func removeSnapshotSchedule(context *clusterd.Context, clusterInfo *ClusterInfo,
 	return nil
 }
 
-func enableSnapshotSchedules(context *clusterd.Context, clusterInfo *ClusterInfo, poolSpec cephv1.PoolSpec, poolName string) error {
+func enableSnapshotSchedules(context *clusterd.Context, clusterInfo *ClusterInfo, pool cephv1.NamedPoolSpec) error {
 	logger.Info("resetting current snapshot schedules")
 	// Reset any existing schedules
-	err := removeSnapshotSchedules(context, clusterInfo, poolSpec, poolName)
+	err := removeSnapshotSchedules(context, clusterInfo, pool)
 	if err != nil {
 		logger.Errorf("failed to remove snapshot schedules. %v", err)
 	}
 
 	// Enable all the snap schedules
-	for _, snapSchedule := range poolSpec.Mirroring.SnapshotSchedules {
-		err := enableSnapshotSchedule(context, clusterInfo, snapSchedule, poolName)
+	for _, snapSchedule := range pool.Mirroring.SnapshotSchedules {
+		err := enableSnapshotSchedule(context, clusterInfo, snapSchedule, pool.Name)
 		if err != nil {
 			return errors.Wrap(err, "failed to enable snapshot schedule")
 		}
@@ -210,16 +266,16 @@ func enableSnapshotSchedules(context *clusterd.Context, clusterInfo *ClusterInfo
 }
 
 // removeSnapshotSchedules removes all the existing snapshot schedules
-func removeSnapshotSchedules(context *clusterd.Context, clusterInfo *ClusterInfo, poolSpec cephv1.PoolSpec, poolName string) error {
+func removeSnapshotSchedules(context *clusterd.Context, clusterInfo *ClusterInfo, pool cephv1.NamedPoolSpec) error {
 	// Get the list of existing snapshot schedule
-	existingSnapshotSchedules, err := listSnapshotSchedules(context, clusterInfo, poolName)
+	existingSnapshotSchedules, err := listSnapshotSchedules(context, clusterInfo, pool.Name)
 	if err != nil {
 		return errors.Wrap(err, "failed to list snapshot schedule(s)")
 	}
 
 	// Remove each schedule
 	for _, existingSnapshotSchedule := range existingSnapshotSchedules {
-		err := removeSnapshotSchedule(context, clusterInfo, existingSnapshotSchedule, poolName)
+		err := removeSnapshotSchedule(context, clusterInfo, existingSnapshotSchedule, pool.Name)
 		if err != nil {
 			return errors.Wrapf(err, "failed to remove snapshot schedule %v", existingSnapshotSchedule)
 		}
@@ -272,4 +328,59 @@ func ListSnapshotSchedulesRecursively(context *clusterd.Context, clusterInfo *Cl
 
 	logger.Debugf("successfully recursively listed snapshot schedules for pool %q", poolName)
 	return snapshotSchedulesRecursive, nil
+}
+
+/* CreateRBDMirrorBootstrapPeerWithoutPool creates a bootstrap peer for the current cluster
+It creates the cephx user for the remote cluster to use with all the necessary details
+This function is handy on scenarios where no pools have been created yet but replication communication is required (connecting peers)
+It essentially sits above CreateRBDMirrorBootstrapPeer()
+and is a cluster-wide option in the scenario where all the pools will be mirrored to the same remote cluster
+
+So the scenario looks like:
+
+	1) Create the cephx ID on the source cluster
+
+	2) Enable a source pool for mirroring - at any time, we just don't know when
+	rbd --cluster site-a mirror pool enable image-pool image
+
+	3) Copy the key details over to the other cluster (non-ceph workflow)
+
+	4) Enable destination pool for mirroring
+	rbd --cluster site-b mirror pool enable image-pool image
+
+	5) Add the peer details to the destination pool
+
+	6) Repeat the steps flipping source and destination to enable
+	bi-directional mirroring
+*/
+func CreateRBDMirrorBootstrapPeerWithoutPool(context *clusterd.Context, clusterInfo *ClusterInfo) ([]byte, error) {
+	fullClientName := getQualifiedUser(rbdMirrorPeerKeyringID)
+	logger.Infof("create rbd-mirror bootstrap peer token %q", fullClientName)
+	key, err := AuthGetOrCreateKey(context, clusterInfo, fullClientName, rbdMirrorPeerCaps)
+	if err != nil {
+		return nil, errors.Wrapf(err, "failed to create rbd-mirror peer key %q", fullClientName)
+	}
+	logger.Infof("successfully created rbd-mirror bootstrap peer token for cluster %q", clusterInfo.NamespacedName().Name)
+
+	mons := sets.NewString()
+	for _, mon := range clusterInfo.Monitors {
+		mons.Insert(mon.Endpoint)
+	}
+
+	peerToken := PeerToken{
+		ClusterFSID: clusterInfo.FSID,
+		ClientID:    rbdMirrorPeerKeyringID,
+		Key:         key,
+		MonHost:     strings.Join(mons.List(), ","),
+		Namespace:   clusterInfo.Namespace,
+	}
+
+	// Marshal the Go type back to JSON
+	decodedTokenBackToJSON, err := json.Marshal(peerToken)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to encode peer token to json")
+	}
+
+	// Return the base64 encoded token
+	return []byte(base64.StdEncoding.EncodeToString(decodedTokenBackToJSON)), nil
 }

@@ -3,6 +3,7 @@ title: Block Pool CRD
 weight: 2700
 indent: true
 ---
+{% include_relative branch.liquid %}
 
 # Ceph Block Pool CRD
 
@@ -30,6 +31,30 @@ spec:
     size: 3
   deviceClass: hdd
 ```
+
+#### Hybrid Storage Pools
+Hybrid storage is a combination of two different storage tiers. For example, SSD and HDD.
+This helps to improve the read performance of cluster by placing, say, 1st copy of data on the higher performance tier (SSD or NVME) and remaining replicated copies on lower cost tier (HDDs).
+
+**WARNING** Hybrid storage pools are likely to suffer from lower availability if a node goes down. The data across the two
+tiers may actually end up on the same node, instead of being spread across unique nodes (or failure domains) as expected.
+Instead of using hybrid pools, consider configuring [primary affinity](https://docs.ceph.com/en/latest/rados/operations/crush-map/#primary-affinity) from the toolbox.
+
+```yaml
+apiVersion: ceph.rook.io/v1
+kind: CephBlockPool
+metadata:
+  name: replicapool
+  namespace: rook-ceph
+spec:
+  failureDomain: host
+  replicated:
+    size: 3
+    hybridStorage:
+      primaryDeviceClass: ssd
+      secondaryDeviceClass: hdd
+```
+> **IMPORTANT**: The device classes `primaryDeviceClass` and `secondaryDeviceClass` must have at least one OSD associated with them or else the pool creation will fail.
 
 ### Erasure Coded
 
@@ -64,7 +89,7 @@ When creating an erasure-coded pool, it is highly recommended to create the pool
 RADOS Block Device (RBD) mirroring is a process of asynchronous replication of Ceph block device images between two or more Ceph clusters.
 Mirroring ensures point-in-time consistent replicas of all changes to an image, including reads and writes, block device resizing, snapshots, clones and flattening.
 It is generally useful when planning for Disaster Recovery.
-For clusters that are geographically distributed and stretching is not possible due to high latencies.
+Mirroring is for clusters that are geographically distributed and stretching a single cluster is not possible due to high latencies.
 
 The following will enable mirroring of the pool at the image level:
 
@@ -168,7 +193,7 @@ stretched) then you will have 2 replicas per datacenter where each replica ends 
 * `erasureCoded`: Settings for an erasure-coded pool. If specified, `replicated` settings must not be specified. See below for more details on [erasure coding](#erasure-coding).
   * `dataChunks`: Number of chunks to divide the original object into
   * `codingChunks`: Number of coding chunks to generate
-* `failureDomain`: The failure domain across which the data will be spread. This can be set to a value of either `osd` or `host`, with `host` being the default setting. A failure domain can also be set to a different type (e.g. `rack`), if it is added as a `location` in the [Storage Selection Settings](ceph-cluster-crd.md#storage-selection-settings).
+* `failureDomain`: The failure domain across which the data will be spread. This can be set to a value of either `osd` or `host`, with `host` being the default setting. A failure domain can also be set to a different type (e.g. `rack`), if the OSDs are created on nodes with the supported [topology labels](ceph-cluster-crd.md#osd-topology). If the `failureDomain` is changed on the pool, the operator will create a new CRUSH rule and update the pool.
     If a `replicated` pool of size `3` is configured and the `failureDomain` is set to `host`, all three copies of the replicated data will be placed on OSDs located on `3` different Ceph hosts. This case is guaranteed to tolerate a failure of two hosts without a loss of data. Similarly, a failure domain set to `osd`, can tolerate a loss of two OSD devices.
 
     If erasure coding is used, the data and coding chunks are spread across the configured failure domain.
@@ -177,6 +202,11 @@ stretched) then you will have 2 replicas per datacenter where each replica ends 
 * `deviceClass`: Sets up the CRUSH rule for the pool to distribute data only on the specified device class. If left empty or unspecified, the pool will use the cluster's default CRUSH root, which usually distributes data over all OSDs, regardless of their class.
 * `crushRoot`: The root in the crush map to be used by the pool. If left empty or unspecified, the default root will be used. Creating a crush hierarchy for the OSDs currently requires the Rook toolbox to run the Ceph tools described [here](http://docs.ceph.com/docs/master/rados/operations/crush-map/#modifying-the-crush-map).
 * `enableRBDStats`: Enables collecting RBD per-image IO statistics by enabling dynamic OSD performance counters. Defaults to false. For more info see the [ceph documentation](https://docs.ceph.com/docs/master/mgr/prometheus/#rbd-io-statistics).
+* `name`: The name of Ceph pools is based on the `metadata.name` of the CephBlockPool CR. Some built-in Ceph pools
+  require names that are incompatible with K8s resource names. These special pools can be configured
+  by setting this `name` to override the name of the Ceph pool that is created instead of using the `metadata.name` for the pool.
+  Only the following pool names are supported: `device_health_metrics`, `.nfs`, and `.mgr`. See the example
+  [builtin mgr pool](https://github.com/rook/rook/blob/{{ branchName }}/deploy/examples/pool-builtin-mgr.yaml).
 
 * `parameters`: Sets any [parameters](https://docs.ceph.com/docs/master/rados/operations/pools/#set-pool-values) listed to the given pool
   * `target_size_ratio:` gives a hint (%) to Ceph in terms of expected consumption of the total cluster capacity of a given pool, for more info see the [ceph documentation](https://docs.ceph.com/docs/master/rados/operations/placement-groups/#specifying-expected-pool-size)
@@ -185,9 +215,11 @@ stretched) then you will have 2 replicas per datacenter where each replica ends 
 * `mirroring`: Sets up mirroring of the pool
   * `enabled`: whether mirroring is enabled on that pool (default: false)
   * `mode`: mirroring mode to run, possible values are "pool" or "image" (required). Refer to the [mirroring modes Ceph documentation](https://docs.ceph.com/docs/master/rbd/rbd-mirroring/#enable-mirroring) for more details.
-  * `snapshotSchedules`: schedule(s) snapshot at the **pool** level. **Only** supported as of Ceph Octopus release. One or more schedules are supported.
+  * `snapshotSchedules`: schedule(s) snapshot at the **pool** level. **Only** supported as of Ceph Octopus (v15) release. One or more schedules are supported.
     * `interval`: frequency of the snapshots. The interval can be specified in days, hours, or minutes using d, h, m suffix respectively.
     * `startTime`: optional, determines at what time the snapshot process starts, specified using the ISO 8601 time format.
+  * `peers`: to configure mirroring peers. See the prerequisite [RBD Mirror documentation](ceph-rbd-mirror-crd.md) first.
+    * `secretNames`:  a list of peers to connect to. Currently **only a single** peer is supported where a peer represents a Ceph cluster.
 
 * `statusCheck`: Sets up pool mirroring status
   * `mirror`: displays the mirroring status

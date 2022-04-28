@@ -28,10 +28,12 @@ import (
 	"github.com/rook/rook/pkg/clusterd"
 	"github.com/rook/rook/pkg/daemon/ceph/client"
 	"github.com/rook/rook/pkg/operator/ceph/disruption/controllerconfig"
+	"github.com/rook/rook/pkg/operator/test"
 	exectest "github.com/rook/rook/pkg/util/exec/test"
 	"github.com/stretchr/testify/assert"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	policyv1 "k8s.io/api/policy/v1"
 	policyv1beta1 "k8s.io/api/policy/v1beta1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -118,18 +120,15 @@ func fakePDBConfigMap(drainingFailureDomain string) *corev1.ConfigMap {
 
 func getFakeReconciler(t *testing.T, obj ...runtime.Object) *ReconcileClusterDisruption {
 	scheme := scheme.Scheme
-	err := policyv1beta1.AddToScheme(scheme)
-	if err != nil {
-		assert.Fail(t, "failed to build scheme")
-	}
+	err := policyv1.AddToScheme(scheme)
+	assert.NoError(t, err)
+	err = policyv1beta1.AddToScheme(scheme)
+	assert.NoError(t, err)
+
 	err = appsv1.AddToScheme(scheme)
-	if err != nil {
-		assert.Fail(t, "failed to build scheme")
-	}
+	assert.NoError(t, err)
 	err = corev1.AddToScheme(scheme)
-	if err != nil {
-		assert.Fail(t, "failed to build scheme")
-	}
+	assert.NoError(t, err)
 	client := fake.NewClientBuilder().WithScheme(scheme).WithRuntimeObjects(obj...).Build()
 
 	return &ReconcileClusterDisruption{
@@ -228,6 +227,7 @@ func TestGetOSDFailureDomains(t *testing.T) {
 			}
 			r := getFakeReconciler(t, objs...)
 			clusterInfo := getFakeClusterInfo()
+			clusterInfo.Context = context.TODO()
 			request := reconcile.Request{NamespacedName: types.NamespacedName{Namespace: namespace}}
 			allfailureDomains, nodeDrainFailureDomains, osdDownFailureDomains, err := r.getOSDFailureDomains(clusterInfo, request, "zone")
 			assert.NoError(t, err)
@@ -263,6 +263,7 @@ func TestGetOSDFailureDomainsError(t *testing.T) {
 			r := getFakeReconciler(t, cephCluster, &corev1.ConfigMap{},
 				tc.osds[1].DeepCopy(), tc.osds[2].DeepCopy(), osd)
 			clusterInfo := getFakeClusterInfo()
+			clusterInfo.Context = context.TODO()
 			request := reconcile.Request{NamespacedName: types.NamespacedName{Namespace: namespace}}
 			allfailureDomains, nodeDrainFailureDomains, osdDownFailureDomains, err := r.getOSDFailureDomains(clusterInfo, request, "zone")
 			assert.Error(t, err)
@@ -345,9 +346,10 @@ func TestReconcilePDBForOSD(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			r := getFakeReconciler(t, cephCluster, tc.configMap)
 			clusterInfo := getFakeClusterInfo()
+			clusterInfo.Context = context.TODO()
 			request := reconcile.Request{NamespacedName: types.NamespacedName{Namespace: namespace}}
 			executor := &exectest.MockExecutor{}
-			executor.MockExecuteCommandWithOutputFile = func(command, outputFile string, args ...string) (string, error) {
+			executor.MockExecuteCommandWithOutput = func(command string, args ...string) (string, error) {
 				logger.Infof("Command: %s %v", command, args)
 				if args[0] == "status" {
 					return tc.fakeCephStatus, nil
@@ -357,16 +359,32 @@ func TestReconcilePDBForOSD(t *testing.T) {
 				}
 				return "", errors.Errorf("unexpected ceph command '%v'", args)
 			}
-			r.context = &controllerconfig.Context{ClusterdContext: &clusterd.Context{Executor: executor}}
+			clientset := test.New(t, 3)
+
+			// check for PDBV1 version
+			test.SetFakeKubernetesVersion(clientset, "v1.21.0")
+			r.context = &controllerconfig.Context{ClusterdContext: &clusterd.Context{Executor: executor, Clientset: clientset}}
 			_, err := r.reconcilePDBsForOSDs(clusterInfo, request, tc.configMap, "zone", tc.allFailureDomains, tc.osdDownFailureDomains, tc.activeNodeDrains)
 			assert.NoError(t, err)
 
 			// assert that pdb for osd are created correctly
-			existingPDBs := &policyv1beta1.PodDisruptionBudgetList{}
-			err = r.client.List(context.TODO(), existingPDBs)
+			existingPDBsV1 := &policyv1.PodDisruptionBudgetList{}
+			err = r.client.List(context.TODO(), existingPDBsV1)
 			assert.NoError(t, err)
-			assert.Equal(t, tc.expectedOSDPDBCount, len(existingPDBs.Items))
-			for _, pdb := range existingPDBs.Items {
+			assert.Equal(t, tc.expectedOSDPDBCount, len(existingPDBsV1.Items))
+			for _, pdb := range existingPDBsV1.Items {
+				assert.Equal(t, tc.expectedMaxUnavailableCount, pdb.Spec.MaxUnavailable.IntValue())
+			}
+			// check for PDBV1Beta1 version
+			test.SetFakeKubernetesVersion(clientset, "v1.20.0")
+			r.context = &controllerconfig.Context{ClusterdContext: &clusterd.Context{Executor: executor, Clientset: clientset}}
+			_, err = r.reconcilePDBsForOSDs(clusterInfo, request, tc.configMap, "zone", tc.allFailureDomains, tc.osdDownFailureDomains, tc.activeNodeDrains)
+			assert.NoError(t, err)
+			existingPDBsV1Beta1 := &policyv1beta1.PodDisruptionBudgetList{}
+			err = r.client.List(context.TODO(), existingPDBsV1Beta1)
+			assert.NoError(t, err)
+			assert.Equal(t, tc.expectedOSDPDBCount, len(existingPDBsV1Beta1.Items))
+			for _, pdb := range existingPDBsV1Beta1.Items {
 				assert.Equal(t, tc.expectedMaxUnavailableCount, pdb.Spec.MaxUnavailable.IntValue())
 			}
 
@@ -385,9 +403,10 @@ func TestPGHealthcheckTimeout(t *testing.T) {
 	pdbConfig := fakePDBConfigMap("")
 	r := getFakeReconciler(t, cephCluster, pdbConfig)
 	clusterInfo := getFakeClusterInfo()
+	clusterInfo.Context = context.TODO()
 	request := reconcile.Request{NamespacedName: types.NamespacedName{Namespace: namespace}}
 	executor := &exectest.MockExecutor{}
-	executor.MockExecuteCommandWithOutputFile = func(command, outputFile string, args ...string) (string, error) {
+	executor.MockExecuteCommandWithOutput = func(command string, args ...string) (string, error) {
 		logger.Infof("Command: %s %v", command, args)
 		if args[0] == "status" {
 			return unHealthyCephStatus, nil
@@ -397,7 +416,8 @@ func TestPGHealthcheckTimeout(t *testing.T) {
 		}
 		return "", errors.Errorf("unexpected ceph command '%v'", args)
 	}
-	r.context = &controllerconfig.Context{ClusterdContext: &clusterd.Context{Executor: executor}}
+	clientset := test.New(t, 3)
+	r.context = &controllerconfig.Context{ClusterdContext: &clusterd.Context{Executor: executor, Clientset: clientset}}
 	// set PG health check timeout to 10 minutes
 	r.pgHealthCheckTimeout = time.Duration(time.Minute * 10)
 
@@ -428,15 +448,16 @@ func TestPGHealthcheckTimeout(t *testing.T) {
 
 func TestHasNodeDrained(t *testing.T) {
 	osdPOD := fakeOSDPod(0, nodeName)
+	ctx := context.TODO()
 	// Not expecting node drain because OSD pod is assigned to a schedulable node
 	r := getFakeReconciler(t, nodeObj, osdPOD.DeepCopy(), &corev1.ConfigMap{})
-	expected, err := hasOSDNodeDrained(r.client, namespace, "0")
+	expected, err := hasOSDNodeDrained(ctx, r.client, namespace, "0")
 	assert.NoError(t, err)
 	assert.False(t, expected)
 
 	// Expecting node drain because OSD pod is assigned to an unschedulable node
 	r = getFakeReconciler(t, unschedulableNodeObj, osdPOD.DeepCopy(), &corev1.ConfigMap{})
-	expected, err = hasOSDNodeDrained(r.client, namespace, "0")
+	expected, err = hasOSDNodeDrained(ctx, r.client, namespace, "0")
 	assert.NoError(t, err)
 	assert.True(t, expected)
 
@@ -444,7 +465,35 @@ func TestHasNodeDrained(t *testing.T) {
 	osdPodObj := osdPOD.DeepCopy()
 	osdPodObj.Spec.NodeName = ""
 	r = getFakeReconciler(t, nodeObj, osdPodObj, &corev1.ConfigMap{})
-	expected, err = hasOSDNodeDrained(r.client, namespace, "0")
+	expected, err = hasOSDNodeDrained(ctx, r.client, namespace, "0")
 	assert.NoError(t, err)
 	assert.True(t, expected)
+}
+
+func TestGetAllowedDisruptions(t *testing.T) {
+	r := getFakeReconciler(t)
+	clientset := test.New(t, 3)
+	test.SetFakeKubernetesVersion(clientset, "v1.21.0")
+	r.context = &controllerconfig.Context{ClusterdContext: &clusterd.Context{Clientset: clientset}}
+
+	// Default PDB is not available
+	allowedDisruptions, err := r.getAllowedDisruptions(osdPDBAppName, namespace)
+	assert.Error(t, err)
+	assert.Equal(t, int32(-1), allowedDisruptions)
+
+	// Default PDB is available
+	pdb := &policyv1.PodDisruptionBudget{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      osdPDBAppName,
+			Namespace: namespace,
+		},
+		Status: policyv1.PodDisruptionBudgetStatus{
+			DisruptionsAllowed: int32(0),
+		},
+	}
+	err = r.client.Create(context.TODO(), pdb)
+	assert.NoError(t, err)
+	allowedDisruptions, err = r.getAllowedDisruptions(osdPDBAppName, namespace)
+	assert.NoError(t, err)
+	assert.Equal(t, int32(0), allowedDisruptions)
 }

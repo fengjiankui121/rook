@@ -171,6 +171,42 @@ const testCrushMap = `{
         },
         {
             "rule_id": 1,
+            "rule_name": "hybrid_ruleset",
+            "ruleset": 1,
+            "type": 1,
+            "min_size": 1,
+            "max_size": 10,
+            "steps": [
+                {
+                    "op": "take",
+                    "item": -2,
+                    "item_name": "default~hdd"
+                },
+                {
+                    "op": "chooseleaf_firstn",
+                    "num": 1,
+                    "type": "host"
+                },
+                {
+                    "op": "emit"
+                },
+                {
+                    "op": "take",
+                    "item": -2,
+                    "item_name": "default~ssd"
+                },
+                {
+                    "op": "chooseleaf_firstn",
+                    "num": 0,
+                    "type": "host"
+                },
+                {
+                    "op": "emit"
+                }
+            ]
+        },
+        {
+            "rule_id": 1,
             "rule_name": "my-store.rgw.buckets.data",
             "ruleset": 1,
             "type": 3,
@@ -229,25 +265,25 @@ const testCrushMap = `{
 
 func TestGetCrushMap(t *testing.T) {
 	executor := &exectest.MockExecutor{}
-	executor.MockExecuteCommandWithOutputFile = func(command, outputFile string, args ...string) (string, error) {
+	executor.MockExecuteCommandWithOutput = func(command string, args ...string) (string, error) {
 		logger.Infof("Command: %s %v", command, args)
 		if args[1] == "crush" && args[2] == "dump" {
 			return testCrushMap, nil
 		}
 		return "", errors.Errorf("unexpected ceph command '%v'", args)
 	}
-	crush, err := GetCrushMap(&clusterd.Context{Executor: executor}, AdminClusterInfo("mycluster"))
+	crush, err := GetCrushMap(&clusterd.Context{Executor: executor}, AdminTestClusterInfo("mycluster"))
 
 	assert.Nil(t, err)
 	assert.Equal(t, 11, len(crush.Types))
 	assert.Equal(t, 1, len(crush.Devices))
 	assert.Equal(t, 4, len(crush.Buckets))
-	assert.Equal(t, 2, len(crush.Rules))
+	assert.Equal(t, 3, len(crush.Rules))
 }
 
 func TestGetOSDOnHost(t *testing.T) {
 	executor := &exectest.MockExecutor{}
-	executor.MockExecuteCommandWithOutputFile = func(command, outputFile string, args ...string) (string, error) {
+	executor.MockExecuteCommandWithOutput = func(command string, args ...string) (string, error) {
 		logger.Infof("Command: %s %v", command, args)
 		if args[1] == "crush" && args[2] == "ls" {
 			return "[\"osd.2\",\"osd.0\",\"osd.1\"]", nil
@@ -255,7 +291,7 @@ func TestGetOSDOnHost(t *testing.T) {
 		return "", errors.Errorf("unexpected ceph command '%v'", args)
 	}
 
-	_, err := GetOSDOnHost(&clusterd.Context{Executor: executor}, AdminClusterInfo("mycluster"), "my-host")
+	_, err := GetOSDOnHost(&clusterd.Context{Executor: executor}, AdminTestClusterInfo("mycluster"), "my-host")
 	assert.Nil(t, err)
 }
 

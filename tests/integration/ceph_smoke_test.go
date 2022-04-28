@@ -24,7 +24,7 @@ import (
 	"time"
 
 	"github.com/rook/rook/pkg/daemon/ceph/client"
-	oppool "github.com/rook/rook/pkg/operator/ceph/pool"
+	opcontroller "github.com/rook/rook/pkg/operator/ceph/controller"
 	"github.com/rook/rook/tests/framework/clients"
 	"github.com/rook/rook/tests/framework/installer"
 	"github.com/rook/rook/tests/framework/utils"
@@ -61,15 +61,6 @@ import (
 // - Quota limit wrt no of objects
 // ************************************************
 func TestCephSmokeSuite(t *testing.T) {
-	if installer.SkipTestSuite(installer.CephTestSuite) {
-		t.Skip()
-	}
-
-	// Skip the suite if CSI is not supported
-	kh, err := utils.CreateK8sHelper(func() *testing.T { return t })
-	require.NoError(t, err)
-	checkSkipCSITest(t, kh)
-
 	s := new(SmokeSuite)
 	defer func(s *SmokeSuite) {
 		HandlePanics(recover(), s.TearDownSuite, s.T)
@@ -96,16 +87,17 @@ func (s *SmokeSuite) SetupSuite() {
 		UsePVC:                    installer.UsePVC(),
 		Mons:                      3,
 		SkipOSDCreation:           false,
-		UseCSI:                    true,
 		EnableAdmissionController: true,
+		ConnectionsEncrypted:      true,
+		ConnectionsCompressed:     true,
 		UseCrashPruner:            true,
 		EnableVolumeReplication:   true,
-		RookVersion:               installer.VersionMaster,
-		CephVersion:               installer.PacificVersion,
+		ChangeHostName:            true,
+		RookVersion:               installer.LocalBuildTag,
+		CephVersion:               installer.ReturnCephVersion(),
 	}
 	s.settings.ApplyEnvVars()
-
-	s.installer, s.k8sh = StartTestCluster(s.T, s.settings, smokeSuiteMinimalTestVersion)
+	s.installer, s.k8sh = StartTestCluster(s.T, s.settings)
 	s.helper = clients.CreateTestClient(s.k8sh, s.installer.Manifests)
 }
 
@@ -130,7 +122,10 @@ func (s *SmokeSuite) TestObjectStorage_SmokeTest() {
 	if utils.IsPlatformOpenShift() {
 		s.T().Skip("object store tests skipped on openshift")
 	}
-	runObjectE2ETest(s.helper, s.k8sh, s.Suite, s.settings.Namespace)
+	storeName := "lite-store"
+	deleteStore := true
+	tls := false
+	runObjectE2ETestLite(s.T(), s.helper, s.k8sh, s.installer, s.settings.Namespace, storeName, 2, deleteStore, tls)
 }
 
 // Test to make sure all rook components are installed and Running
@@ -148,52 +143,45 @@ func (s *SmokeSuite) TestMonFailover() {
 	require.NoError(s.T(), err)
 	require.Equal(s.T(), 3, len(deployments))
 
+	// Scale down a mon so the operator won't trigger a reconcile
 	monToKill := deployments[0].Name
-	logger.Infof("Killing mon %s", monToKill)
-	propagation := metav1.DeletePropagationForeground
-	delOptions := &metav1.DeleteOptions{PropagationPolicy: &propagation}
-	err = s.k8sh.Clientset.AppsV1().Deployments(s.settings.Namespace).Delete(ctx, monToKill, *delOptions)
-	require.NoError(s.T(), err)
+	logger.Infof("Scaling down mon %s", monToKill)
+	scale, err := s.k8sh.Clientset.AppsV1().Deployments(s.settings.Namespace).GetScale(ctx, monToKill, metav1.GetOptions{})
+	assert.NoError(s.T(), err)
+	scale.Spec.Replicas = 0
+	_, err = s.k8sh.Clientset.AppsV1().Deployments(s.settings.Namespace).UpdateScale(ctx, monToKill, scale, metav1.UpdateOptions{})
+	assert.NoError(s.T(), err)
 
 	// Wait for the health check to start a new monitor
-	originalMonDeleted := false
 	for i := 0; i < 30; i++ {
 		deployments, err := s.getNonCanaryMonDeployments()
 		require.NoError(s.T(), err)
 
-		// Make sure the old mon is not still alive
-		foundOldMon := false
-		for _, mon := range deployments {
+		var currentMons []string
+		var originalMonDeployment *appsv1.Deployment
+		for i, mon := range deployments {
+			currentMons = append(currentMons, mon.Name)
 			if mon.Name == monToKill {
-				foundOldMon = true
+				originalMonDeployment = &deployments[i]
 			}
 		}
+		logger.Infof("mon deployments: %v", currentMons)
 
-		// Check if we have three monitors
-		if foundOldMon {
-			if originalMonDeleted {
-				// Depending on the state of the orchestration, the operator might trigger
-				// re-creation of the deleted mon. In this case, consider the test successful
-				// rather than wait for the failover which will never occur.
-				logger.Infof("Original mon created again, no need to wait for mon failover")
-				return
-			}
-			logger.Infof("Waiting for old monitor to stop")
-		} else {
-			logger.Infof("Waiting for a new monitor to start")
-			originalMonDeleted = true
-			if len(deployments) == 3 {
-				var newMons []string
-				for _, mon := range deployments {
-					newMons = append(newMons, mon.Name)
-				}
-				logger.Infof("Found a new monitor! monitors=%v", newMons)
-				return
-			}
-
-			assert.Equal(s.T(), 2, len(deployments))
+		// Check if the original mon was scaled up again
+		// Depending on the state of the orchestration, the operator might trigger
+		// re-creation of the deleted mon. In this case, consider the test successful
+		// rather than wait for the failover which will never occur.
+		if originalMonDeployment != nil && *originalMonDeployment.Spec.Replicas > 0 {
+			logger.Infof("Original mon created again, no need to wait for mon failover")
+			return
 		}
 
+		if len(deployments) == 3 && originalMonDeployment == nil {
+			logger.Infof("Found a new monitor!")
+			return
+		}
+
+		logger.Infof("Waiting for a new monitor to start and previous one to be deleted")
 		time.Sleep(5 * time.Second)
 	}
 
@@ -210,7 +198,7 @@ func (s *SmokeSuite) TestPoolResize() {
 	require.NoError(s.T(), err)
 
 	poolFound := false
-	clusterInfo := client.AdminClusterInfo(s.settings.Namespace)
+	clusterInfo := client.AdminTestClusterInfo(s.settings.Namespace)
 
 	// Wait for pool to appear
 	for i := 0; i < 10; i++ {
@@ -264,30 +252,12 @@ func (s *SmokeSuite) TestPoolResize() {
 	pool, err := s.k8sh.RookClientset.CephV1().CephBlockPools(s.settings.Namespace).Get(ctx, poolName, metav1.GetOptions{})
 	assert.NoError(s.T(), err)
 	if pool.Spec.Mirroring.Enabled {
-		secretName := pool.Status.Info[oppool.RBDMirrorBootstrapPeerSecretName]
+		secretName := pool.Status.Info[opcontroller.RBDMirrorBootstrapPeerSecretName]
 		assert.NotEmpty(s.T(), secretName)
 		// now fetch the secret which contains the bootstrap peer token
 		secret, err := s.k8sh.Clientset.CoreV1().Secrets(s.settings.Namespace).Get(ctx, secretName, metav1.GetOptions{})
 		require.NoError(s.T(), err)
 		assert.NotEmpty(s.T(), secret.Data["token"])
-
-		// Once we have a scenario with another Ceph cluster - needs to be added in the MultiCluster suite
-		// We would need to add a bootstrap peer token following the below procedure
-		// bootstrapSecretName := "bootstrap-peer-token"
-		// token := "eyJmc2lkIjoiYzZiMDg3ZjItNzgyOS00ZGJiLWJjZmMtNTNkYzM0ZTBiMzVkIiwiY2xpZW50X2lkIjoicmJkLW1pcnJvci1wZWVyIiwia2V5IjoiQVFBV1lsWmZVQ1Q2RGhBQVBtVnAwbGtubDA5YVZWS3lyRVV1NEE9PSIsIm1vbl9ob3N0IjoiW3YyOjE5Mi4xNjguMTExLjEwOjMzMDAsdjE6MTkyLjE2OC4xMTEuMTA6Njc4OV0sW3YyOjE5Mi4xNjguMTExLjEyOjMzMDAsdjE6MTkyLjE2OC4xMTEuMTI6Njc4OV0sW3YyOjE5Mi4xNjguMTExLjExOjMzMDAsdjE6MTkyLjE2OC4xMTEuMTE6Njc4OV0ifQ=="
-		// s = oppool.GenerateBootstrapPeerSecret(bootstrapSecretName, s.settings.Namespace, string(pool.GetUID()), []byte(token))
-		// s, err = s.k8sh.Clientset.CoreV1().Secrets(s.settings.Namespace).Create(s)
-		// require.Nil(s.T(), err, err.Error())
-
-		// // update the ceph block pool cr
-		// pool.Spec.Mirrored.PeersSecretNames = append(pool.Spec.Mirrored.PeersSecretNames, bootstrapSecretName)
-		// _, err = s.k8sh.RookClientset.CephV1().CephBlockPools(s.settings.Namespace).Update(pool)
-		// require.Nil(s.T(), err, err.Error())
-
-		// mirrorInfo, err := client.PrintPoolMirroringInfo(s.k8sh.MakeContext(), clusterInfo, poolName)
-		// require.Nil(s.T(), err, err.Error())
-		// assert.Equal(s.T(), "image", mirrorInfo.Mode)
-		// assert.Equal(s.T(), 1, len(mirrorInfo.Peers))
 	}
 
 	// clean up the pool
@@ -305,7 +275,7 @@ func (s *SmokeSuite) TestCreateClient() {
 		"mgr": "allow rwx",
 		"osd": "allow rwx",
 	}
-	clusterInfo := client.AdminClusterInfo(s.settings.Namespace)
+	clusterInfo := client.AdminTestClusterInfo(s.settings.Namespace)
 	err := s.helper.UserClient.Create(clientName, s.settings.Namespace, caps)
 	require.NoError(s.T(), err)
 

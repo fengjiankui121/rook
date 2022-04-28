@@ -19,10 +19,8 @@ package mon
 import (
 	"context"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"reflect"
-	"sync"
 	"testing"
 	"time"
 
@@ -31,15 +29,17 @@ import (
 	cephclient "github.com/rook/rook/pkg/daemon/ceph/client"
 	clienttest "github.com/rook/rook/pkg/daemon/ceph/client/test"
 	"github.com/rook/rook/pkg/operator/ceph/config"
+	opcontroller "github.com/rook/rook/pkg/operator/ceph/controller"
+	"github.com/rook/rook/pkg/operator/ceph/version"
 	testopk8s "github.com/rook/rook/pkg/operator/k8sutil/test"
 	"github.com/rook/rook/pkg/operator/test"
 	exectest "github.com/rook/rook/pkg/util/exec/test"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"github.com/tevino/abool"
 	apps "k8s.io/api/apps/v1"
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes"
 )
 
 func TestCheckHealth(t *testing.T) {
@@ -48,36 +48,37 @@ func TestCheckHealth(t *testing.T) {
 	updateDeploymentAndWait, deploymentsUpdated = testopk8s.UpdateDeploymentAndWaitStub()
 
 	executor := &exectest.MockExecutor{
-		MockExecuteCommandWithOutputFile: func(command string, outFileArg string, args ...string) (string, error) {
+		MockExecuteCommandWithOutput: func(command string, args ...string) (string, error) {
+			logger.Infof("executing command: %s %+v", command, args)
+			if args[0] == "auth" && args[1] == "get-or-create-key" {
+				return "{\"key\":\"mysecurekey\"}", nil
+			}
 			return clienttest.MonInQuorumResponse(), nil
 		},
 	}
 	clientset := test.New(t, 1)
-	configDir, _ := ioutil.TempDir("", "")
-	defer os.RemoveAll(configDir)
+	configDir := t.TempDir()
 	context := &clusterd.Context{
-		Clientset:                  clientset,
-		ConfigDir:                  configDir,
-		Executor:                   executor,
-		RequestCancelOrchestration: abool.New(),
+		Clientset: clientset,
+		ConfigDir: configDir,
+		Executor:  executor,
 	}
 	ownerInfo := cephclient.NewMinimumOwnerInfoWithOwnerRef()
-	c := New(context, "ns", cephv1.ClusterSpec{}, ownerInfo, &sync.Mutex{})
+	c := New(ctx, context, "ns", cephv1.ClusterSpec{}, ownerInfo)
 	// clusterInfo is nil so we return err
-	err := c.checkHealth()
+	err := c.checkHealth(ctx)
 	assert.NotNil(t, err)
 
 	setCommonMonProperties(c, 1, cephv1.MonSpec{Count: 0, AllowMultiplePerNode: true}, "myversion")
 	// mon count is 0 so we return err
-	err = c.checkHealth()
+	err = c.checkHealth(ctx)
 	assert.NotNil(t, err)
 
 	c.spec.Mon.Count = 3
 	logger.Infof("initial mons: %v", c.ClusterInfo.Monitors)
 	c.waitForStart = false
-	defer os.RemoveAll(c.context.ConfigDir)
 
-	c.mapping.Schedule["f"] = &MonScheduleInfo{
+	c.mapping.Schedule["f"] = &opcontroller.MonScheduleInfo{
 		Name:    "node0",
 		Address: "",
 	}
@@ -89,7 +90,8 @@ func TestCheckHealth(t *testing.T) {
 		return SchedulingResult{Node: node}, nil
 	}
 
-	err = c.checkHealth()
+	c.ClusterInfo.Context = ctx
+	err = c.checkHealth(ctx)
 	assert.Nil(t, err)
 	logger.Infof("mons after checkHealth: %v", c.ClusterInfo.Monitors)
 	assert.ElementsMatch(t, []string{"rook-ceph-mon-a", "rook-ceph-mon-f"}, testopk8s.DeploymentNamesUpdated(deploymentsUpdated))
@@ -149,12 +151,108 @@ func TestCheckHealth(t *testing.T) {
 	}
 }
 
+func TestSkipMonFailover(t *testing.T) {
+	c := New(context.TODO(), &clusterd.Context{}, "ns", cephv1.ClusterSpec{}, nil)
+	c.ClusterInfo = clienttest.CreateTestClusterInfo(1)
+	monName := "arb"
+
+	t.Run("don't skip failover for non-stretch", func(t *testing.T) {
+		assert.NoError(t, c.allowFailover(monName))
+	})
+
+	t.Run("don't skip failover for non-arbiter", func(t *testing.T) {
+		c.spec.Mon.Count = 5
+		c.spec.Mon.StretchCluster = &cephv1.StretchClusterSpec{
+			Zones: []cephv1.StretchClusterZoneSpec{
+				{Name: "a"},
+				{Name: "b"},
+				{Name: "c", Arbiter: true},
+			},
+		}
+
+		assert.NoError(t, c.allowFailover(monName))
+	})
+
+	t.Run("skip failover for arbiter if an older version of ceph", func(t *testing.T) {
+		c.arbiterMon = monName
+		c.ClusterInfo.CephVersion = version.CephVersion{Major: 16, Minor: 2, Extra: 6}
+		assert.Error(t, c.allowFailover(monName))
+	})
+
+	t.Run("don't skip failover for arbiter if a newer version of ceph", func(t *testing.T) {
+		c.ClusterInfo.CephVersion = version.CephVersion{Major: 16, Minor: 2, Extra: 7}
+		assert.NoError(t, c.allowFailover(monName))
+	})
+}
+
+func TestEvictMonOnSameNode(t *testing.T) {
+	ctx := context.TODO()
+	clientset := test.New(t, 1)
+	configDir := t.TempDir()
+	executor := &exectest.MockExecutor{
+		MockExecuteCommandWithOutput: func(command string, args ...string) (string, error) {
+			logger.Infof("executing command: %s %+v", command, args)
+			return "{\"key\":\"mysecurekey\"}", nil
+		},
+	}
+	context := &clusterd.Context{Clientset: clientset, ConfigDir: configDir, Executor: executor}
+	ownerInfo := cephclient.NewMinimumOwnerInfoWithOwnerRef()
+	c := New(ctx, context, "ns", cephv1.ClusterSpec{}, ownerInfo)
+	setCommonMonProperties(c, 1, cephv1.MonSpec{Count: 0}, "myversion")
+	c.maxMonID = 2
+	c.waitForStart = false
+	waitForMonitorScheduling = func(c *Cluster, d *apps.Deployment) (SchedulingResult, error) {
+		node, _ := clientset.CoreV1().Nodes().Get(ctx, "node0", metav1.GetOptions{})
+		return SchedulingResult{Node: node}, nil
+	}
+
+	c.spec.Mon.Count = 3
+	createTestMonPod(t, clientset, c, "a", "node1")
+
+	// Nothing to evict with a single mon
+	err := c.evictMonIfMultipleOnSameNode()
+	assert.NoError(t, err)
+
+	// Create a second mon on a different node
+	createTestMonPod(t, clientset, c, "b", "node2")
+
+	// Nothing to evict with where mons are on different nodes
+	err = c.evictMonIfMultipleOnSameNode()
+	assert.NoError(t, err)
+
+	// Create a third mon on the same node as mon a
+	createTestMonPod(t, clientset, c, "c", "node1")
+	assert.Equal(t, 2, c.maxMonID)
+
+	// Should evict either mon a or mon c since they are on the same node and failover to mon d
+	c.ClusterInfo.Context = ctx
+	err = c.evictMonIfMultipleOnSameNode()
+	assert.NoError(t, err)
+	_, err = clientset.AppsV1().Deployments(c.Namespace).Get(ctx, "rook-ceph-mon-d", metav1.GetOptions{})
+	assert.NoError(t, err)
+	assert.Equal(t, 3, c.maxMonID)
+}
+
+func createTestMonPod(t *testing.T, clientset kubernetes.Interface, c *Cluster, name, node string) {
+	m := &monConfig{ResourceName: resourceName(name), DaemonName: name, DataPathMap: &config.DataPathMap{}}
+	d, err := c.makeDeployment(m, false)
+	assert.NoError(t, err)
+	monPod := &v1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "mon-pod-" + name, Namespace: c.Namespace, Labels: d.Labels},
+		Spec:       d.Spec.Template.Spec,
+	}
+	monPod.Spec.NodeName = node
+	monPod.Status.Phase = v1.PodRunning
+	_, err = clientset.CoreV1().Pods(c.Namespace).Create(context.TODO(), monPod, metav1.CreateOptions{})
+	assert.NoError(t, err)
+}
+
 func TestScaleMonDeployment(t *testing.T) {
 	ctx := context.TODO()
 	clientset := test.New(t, 1)
 	context := &clusterd.Context{Clientset: clientset}
 	ownerInfo := cephclient.NewMinimumOwnerInfoWithOwnerRef()
-	c := New(context, "ns", cephv1.ClusterSpec{}, ownerInfo, &sync.Mutex{})
+	c := New(ctx, context, "ns", cephv1.ClusterSpec{}, ownerInfo)
 	setCommonMonProperties(c, 1, cephv1.MonSpec{Count: 0, AllowMultiplePerNode: true}, "myversion")
 
 	name := "a"
@@ -188,29 +286,30 @@ func TestCheckHealthNotFound(t *testing.T) {
 	updateDeploymentAndWait, deploymentsUpdated = testopk8s.UpdateDeploymentAndWaitStub()
 
 	executor := &exectest.MockExecutor{
-		MockExecuteCommandWithOutputFile: func(command string, outFileArg string, args ...string) (string, error) {
+		MockExecuteCommandWithOutput: func(command string, args ...string) (string, error) {
+			logger.Infof("executing command: %s %+v", command, args)
+			if args[0] == "auth" && args[1] == "get-or-create-key" {
+				return "{\"key\":\"mysecurekey\"}", nil
+			}
 			return clienttest.MonInQuorumResponse(), nil
 		},
 	}
 	clientset := test.New(t, 1)
-	configDir, _ := ioutil.TempDir("", "")
-	defer os.RemoveAll(configDir)
+	configDir := t.TempDir()
 	context := &clusterd.Context{
-		Clientset:                  clientset,
-		ConfigDir:                  configDir,
-		Executor:                   executor,
-		RequestCancelOrchestration: abool.New(),
+		Clientset: clientset,
+		ConfigDir: configDir,
+		Executor:  executor,
 	}
 	ownerInfo := cephclient.NewMinimumOwnerInfoWithOwnerRef()
-	c := New(context, "ns", cephv1.ClusterSpec{}, ownerInfo, &sync.Mutex{})
+	c := New(ctx, context, "ns", cephv1.ClusterSpec{}, ownerInfo)
 	setCommonMonProperties(c, 2, cephv1.MonSpec{Count: 3, AllowMultiplePerNode: true}, "myversion")
 	c.waitForStart = false
-	defer os.RemoveAll(c.context.ConfigDir)
 
-	c.mapping.Schedule["a"] = &MonScheduleInfo{
+	c.mapping.Schedule["a"] = &opcontroller.MonScheduleInfo{
 		Name: "node0",
 	}
-	c.mapping.Schedule["b"] = &MonScheduleInfo{
+	c.mapping.Schedule["b"] = &opcontroller.MonScheduleInfo{
 		Name: "node0",
 	}
 	c.maxMonID = 4
@@ -221,13 +320,13 @@ func TestCheckHealthNotFound(t *testing.T) {
 	// Check if the two mons are found in the configmap
 	cm, err := c.context.Clientset.CoreV1().ConfigMaps(c.Namespace).Get(ctx, EndpointConfigMapName, metav1.GetOptions{})
 	assert.Nil(t, err)
-	if cm.Data[EndpointDataKey] != "a=1.2.3.1:6789,b=1.2.3.2:6789" {
-		assert.Equal(t, "b=1.2.3.2:6789,a=1.2.3.1:6789", cm.Data[EndpointDataKey])
+	if cm.Data[EndpointDataKey] != "a=1.2.3.1:3300,b=1.2.3.2:3300" {
+		assert.Equal(t, "b=1.2.3.2:3300,a=1.2.3.1:3300", cm.Data[EndpointDataKey])
 	}
 
 	// Because the mon a isn't in the MonInQuorumResponse() this will create a new mon
 	delete(c.mapping.Schedule, "b")
-	err = c.checkHealth()
+	err = c.checkHealth(ctx)
 	assert.Nil(t, err)
 	// No updates in unit tests w/ workaround
 	assert.ElementsMatch(t, []string{}, testopk8s.DeploymentNamesUpdated(deploymentsUpdated))
@@ -236,39 +335,41 @@ func TestCheckHealthNotFound(t *testing.T) {
 	// recheck that the "not found" mon has been replaced with a new one
 	cm, err = c.context.Clientset.CoreV1().ConfigMaps(c.Namespace).Get(ctx, EndpointConfigMapName, metav1.GetOptions{})
 	assert.Nil(t, err)
-	if cm.Data[EndpointDataKey] != "a=1.2.3.1:6789,f=:6789" {
-		assert.Equal(t, "f=:6789,a=1.2.3.1:6789", cm.Data[EndpointDataKey])
+	if cm.Data[EndpointDataKey] != "a=1.2.3.1:3300,f=:6789" {
+		assert.Equal(t, "f=:6789,a=1.2.3.1:3300", cm.Data[EndpointDataKey])
 	}
 }
 
 func TestAddRemoveMons(t *testing.T) {
+	ctx := context.TODO()
 	var deploymentsUpdated *[]*apps.Deployment
 	updateDeploymentAndWait, deploymentsUpdated = testopk8s.UpdateDeploymentAndWaitStub()
 
 	monQuorumResponse := clienttest.MonInQuorumResponse()
 	executor := &exectest.MockExecutor{
-		MockExecuteCommandWithOutputFile: func(command string, outFileArg string, args ...string) (string, error) {
+		MockExecuteCommandWithOutput: func(command string, args ...string) (string, error) {
+			logger.Infof("executing command: %s %+v", command, args)
+			if args[0] == "auth" && args[1] == "get-or-create-key" {
+				return "{\"key\":\"mysecurekey\"}", nil
+			}
 			return monQuorumResponse, nil
 		},
 	}
 	clientset := test.New(t, 1)
-	configDir, _ := ioutil.TempDir("", "")
-	defer os.RemoveAll(configDir)
+	configDir := t.TempDir()
 	context := &clusterd.Context{
-		Clientset:                  clientset,
-		ConfigDir:                  configDir,
-		Executor:                   executor,
-		RequestCancelOrchestration: abool.New(),
+		Clientset: clientset,
+		ConfigDir: configDir,
+		Executor:  executor,
 	}
 	ownerInfo := cephclient.NewMinimumOwnerInfoWithOwnerRef()
-	c := New(context, "ns", cephv1.ClusterSpec{}, ownerInfo, &sync.Mutex{})
+	c := New(ctx, context, "ns", cephv1.ClusterSpec{}, ownerInfo)
 	setCommonMonProperties(c, 0, cephv1.MonSpec{Count: 5, AllowMultiplePerNode: true}, "myversion")
 	c.maxMonID = 0 // "a" is max mon id
 	c.waitForStart = false
-	defer os.RemoveAll(c.context.ConfigDir)
 
 	// checking the health will increase the mons as desired all in one go
-	err := c.checkHealth()
+	err := c.checkHealth(ctx)
 	assert.Nil(t, err)
 	assert.Equal(t, 5, len(c.ClusterInfo.Monitors), fmt.Sprintf("mons: %v", c.ClusterInfo.Monitors))
 	assert.ElementsMatch(t, []string{
@@ -283,7 +384,7 @@ func TestAddRemoveMons(t *testing.T) {
 	// reducing the mon count to 3 will reduce the mon count once each time we call checkHealth
 	monQuorumResponse = clienttest.MonInQuorumResponseFromMons(c.ClusterInfo.Monitors)
 	c.spec.Mon.Count = 3
-	err = c.checkHealth()
+	err = c.checkHealth(ctx)
 	assert.Nil(t, err)
 	assert.Equal(t, 4, len(c.ClusterInfo.Monitors))
 	// No updates in unit tests w/ workaround
@@ -292,7 +393,7 @@ func TestAddRemoveMons(t *testing.T) {
 
 	// after the second call we will be down to the expected count of 3
 	monQuorumResponse = clienttest.MonInQuorumResponseFromMons(c.ClusterInfo.Monitors)
-	err = c.checkHealth()
+	err = c.checkHealth(ctx)
 	assert.Nil(t, err)
 	assert.Equal(t, 3, len(c.ClusterInfo.Monitors))
 	// No updates in unit tests w/ workaround
@@ -302,7 +403,7 @@ func TestAddRemoveMons(t *testing.T) {
 	// now attempt to reduce the mons down to quorum size 1
 	monQuorumResponse = clienttest.MonInQuorumResponseFromMons(c.ClusterInfo.Monitors)
 	c.spec.Mon.Count = 1
-	err = c.checkHealth()
+	err = c.checkHealth(ctx)
 	assert.Nil(t, err)
 	assert.Equal(t, 2, len(c.ClusterInfo.Monitors))
 	// No updates in unit tests w/ workaround
@@ -311,7 +412,7 @@ func TestAddRemoveMons(t *testing.T) {
 
 	// cannot reduce from quorum size of 2 to 1
 	monQuorumResponse = clienttest.MonInQuorumResponseFromMons(c.ClusterInfo.Monitors)
-	err = c.checkHealth()
+	err = c.checkHealth(ctx)
 	assert.Nil(t, err)
 	assert.Equal(t, 2, len(c.ClusterInfo.Monitors))
 	// No updates in unit tests w/ workaround
@@ -383,25 +484,65 @@ func TestAddOrRemoveExternalMonitor(t *testing.T) {
 
 func TestNewHealthChecker(t *testing.T) {
 	c := &Cluster{spec: cephv1.ClusterSpec{HealthCheck: cephv1.CephClusterHealthCheckSpec{}}}
-	time10s, _ := time.ParseDuration("10s")
-	c10s := &Cluster{spec: cephv1.ClusterSpec{HealthCheck: cephv1.CephClusterHealthCheckSpec{DaemonHealth: cephv1.DaemonHealthSpec{Monitor: cephv1.HealthCheckSpec{Interval: &metav1.Duration{Duration: time10s}}}}}}
 
 	type args struct {
 		monCluster *Cluster
 	}
-	tests := []struct {
+	tests := struct {
 		name string
 		args args
 		want *HealthChecker
 	}{
-		{"default-interval", args{c}, &HealthChecker{c, HealthCheckInterval}},
-		{"10s-interval", args{c10s}, &HealthChecker{c10s, time10s}},
+		"default-interval", args{c}, &HealthChecker{c, HealthCheckInterval},
 	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if got := NewHealthChecker(tt.args.monCluster); !reflect.DeepEqual(got, tt.want) {
-				t.Errorf("NewHealthChecker() = %v, want %v", got, tt.want)
-			}
-		})
-	}
+	t.Run(tests.name, func(t *testing.T) {
+		if got := NewHealthChecker(tests.args.monCluster); !reflect.DeepEqual(got, tests.want) {
+			t.Errorf("NewHealthChecker() = %v, want %v", got, tests.want)
+		}
+	})
+}
+
+func TestUpdateMonTimeout(t *testing.T) {
+	t.Run("using default mon timeout", func(t *testing.T) {
+		m := &Cluster{}
+		updateMonTimeout(m)
+		assert.Equal(t, time.Minute*10, MonOutTimeout)
+	})
+	t.Run("using env var mon timeout", func(t *testing.T) {
+		os.Setenv("ROOK_MON_OUT_TIMEOUT", "10s")
+		defer os.Unsetenv("ROOK_MON_OUT_TIMEOUT")
+		m := &Cluster{}
+		updateMonTimeout(m)
+		assert.Equal(t, time.Second*10, MonOutTimeout)
+	})
+	t.Run("using spec mon timeout", func(t *testing.T) {
+		m := &Cluster{spec: cephv1.ClusterSpec{HealthCheck: cephv1.CephClusterHealthCheckSpec{DaemonHealth: cephv1.DaemonHealthSpec{Monitor: cephv1.HealthCheckSpec{Timeout: "1m"}}}}}
+		updateMonTimeout(m)
+		assert.Equal(t, time.Minute, MonOutTimeout)
+	})
+}
+
+func TestUpdateMonInterval(t *testing.T) {
+	t.Run("using default mon interval", func(t *testing.T) {
+		m := &Cluster{}
+		h := &HealthChecker{m, HealthCheckInterval}
+		updateMonInterval(m, h)
+		assert.Equal(t, time.Second*45, HealthCheckInterval)
+	})
+	t.Run("using env var mon timeout", func(t *testing.T) {
+		os.Setenv("ROOK_MON_HEALTHCHECK_INTERVAL", "10s")
+		defer os.Unsetenv("ROOK_MON_HEALTHCHECK_INTERVAL")
+		m := &Cluster{}
+		h := &HealthChecker{m, HealthCheckInterval}
+		updateMonInterval(m, h)
+		assert.Equal(t, time.Second*10, h.interval)
+	})
+	t.Run("using spec mon timeout", func(t *testing.T) {
+		tm, err := time.ParseDuration("1m")
+		assert.NoError(t, err)
+		m := &Cluster{spec: cephv1.ClusterSpec{HealthCheck: cephv1.CephClusterHealthCheckSpec{DaemonHealth: cephv1.DaemonHealthSpec{Monitor: cephv1.HealthCheckSpec{Interval: &metav1.Duration{Duration: tm}}}}}}
+		h := &HealthChecker{m, HealthCheckInterval}
+		updateMonInterval(m, h)
+		assert.Equal(t, time.Minute, h.interval)
+	})
 }

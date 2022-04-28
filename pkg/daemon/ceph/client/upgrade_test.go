@@ -37,7 +37,7 @@ func TestGetCephMonVersionString(t *testing.T) {
 	}
 	context := &clusterd.Context{Executor: executor}
 
-	_, err := getCephMonVersionString(context, AdminClusterInfo("mycluster"))
+	_, err := getCephMonVersionString(context, AdminTestClusterInfo("mycluster"))
 	assert.NoError(t, err)
 }
 
@@ -49,21 +49,8 @@ func TestGetCephMonVersionsString(t *testing.T) {
 	}
 	context := &clusterd.Context{Executor: executor}
 
-	_, err := getAllCephDaemonVersionsString(context, AdminClusterInfo("mycluster"))
+	_, err := getAllCephDaemonVersionsString(context, AdminTestClusterInfo("mycluster"))
 	assert.Nil(t, err)
-}
-
-func TestEnableMessenger2(t *testing.T) {
-	executor := &exectest.MockExecutor{}
-	executor.MockExecuteCommandWithOutput = func(command string, args ...string) (string, error) {
-		assert.Equal(t, "mon", args[0])
-		assert.Equal(t, "enable-msgr2", args[1])
-		return "", nil
-	}
-	context := &clusterd.Context{Executor: executor}
-
-	err := EnableMessenger2(context, AdminClusterInfo("mycluster"))
-	assert.NoError(t, err)
 }
 
 func TestEnableReleaseOSDFunctionality(t *testing.T) {
@@ -71,12 +58,11 @@ func TestEnableReleaseOSDFunctionality(t *testing.T) {
 	executor.MockExecuteCommandWithOutput = func(command string, args ...string) (string, error) {
 		assert.Equal(t, "osd", args[0])
 		assert.Equal(t, "require-osd-release", args[1])
-		assert.Equal(t, 3, len(args))
 		return "", nil
 	}
 	context := &clusterd.Context{Executor: executor}
 
-	err := EnableReleaseOSDFunctionality(context, AdminClusterInfo("mycluster"), "nautilus")
+	err := EnableReleaseOSDFunctionality(context, AdminTestClusterInfo("mycluster"), "octopus")
 	assert.NoError(t, err)
 }
 
@@ -93,7 +79,7 @@ func TestOkToStopDaemon(t *testing.T) {
 	context := &clusterd.Context{Executor: executor}
 
 	deployment := "rook-ceph-mon-a"
-	err := okToStopDaemon(context, AdminClusterInfo("mycluster"), deployment, "mon", "a")
+	err := okToStopDaemon(context, AdminTestClusterInfo("mycluster"), deployment, "mon", "a")
 	assert.NoError(t, err)
 
 	// Second test
@@ -106,7 +92,7 @@ func TestOkToStopDaemon(t *testing.T) {
 	context = &clusterd.Context{Executor: executor}
 
 	deployment = "rook-ceph-mgr-a"
-	err = okToStopDaemon(context, AdminClusterInfo("mycluster"), deployment, "mgr", "a")
+	err = okToStopDaemon(context, AdminTestClusterInfo("mycluster"), deployment, "mgr", "a")
 	assert.NoError(t, err)
 
 	// Third test
@@ -119,7 +105,7 @@ func TestOkToStopDaemon(t *testing.T) {
 	context = &clusterd.Context{Executor: executor}
 
 	deployment = "rook-ceph-dummy-a"
-	err = okToStopDaemon(context, AdminClusterInfo("mycluster"), deployment, "dummy", "a")
+	err = okToStopDaemon(context, AdminTestClusterInfo("mycluster"), deployment, "dummy", "a")
 	assert.NoError(t, err)
 }
 
@@ -127,7 +113,7 @@ func TestOkToContinue(t *testing.T) {
 	executor := &exectest.MockExecutor{}
 	context := &clusterd.Context{Executor: executor}
 
-	err := OkToContinue(context, AdminClusterInfo("mycluster"), "rook-ceph-mon-a", "mon", "a") // mon is not checked on ok-to-continue so nil is expected
+	err := OkToContinue(context, AdminTestClusterInfo("mycluster"), "rook-ceph-mon-a", "mon", "a") // mon is not checked on ok-to-continue so nil is expected
 	assert.NoError(t, err)
 }
 
@@ -142,8 +128,8 @@ func TestDaemonMapEntry(t *testing.T) {
 	dummyVersionsRaw := []byte(`
 	{
 		"mon": {
-			"ceph version 13.2.5 (cbff874f9007f1869bfd3821b7e33b2a6ffd4988) mimic (stable)": 1,
-			"ceph version 14.2.0 (3a54b2b6d167d4a2a19e003a705696d4fe619afc) nautilus (stable)": 2
+			"ceph version 16.2.5 (cbff874f9007f1869bfd3821b7e33b2a6ffd4988) pacific (stable)": 1,
+			"ceph version 17.2.0 (3a54b2b6d167d4a2a19e003a705696d4fe619afc) quincy (stable)": 2
 		}
 	}`)
 
@@ -301,12 +287,12 @@ func TestGetRetryConfig(t *testing.T) {
 }
 
 func TestOSDUpdateShouldCheckOkToStop(t *testing.T) {
-	clusterInfo := &ClusterInfo{}
+	clusterInfo := AdminTestClusterInfo("mycluster")
 	lsOutput := ""
 	treeOutput := ""
 	context := &clusterd.Context{
 		Executor: &exectest.MockExecutor{
-			MockExecuteCommandWithOutputFile: func(command string, outFileArg string, args ...string) (string, error) {
+			MockExecuteCommandWithOutput: func(command string, args ...string) (string, error) {
 				t.Logf("command: %s %v", command, args)
 				if command != "ceph" || args[0] != "osd" {
 					panic("not a 'ceph osd' call")
@@ -356,6 +342,13 @@ func TestOSDUpdateShouldCheckOkToStop(t *testing.T) {
 	t.Run("0 nodes", func(t *testing.T) {
 		lsOutput = fake.OsdLsOutput(0)
 		treeOutput = fake.OsdTreeOutput(0, 0)
+		assert.False(t, OSDUpdateShouldCheckOkToStop(context, clusterInfo))
+	})
+
+	// degraded case, OSDs are failing to start so they haven't registered in the CRUSH map yet
+	t.Run("0 nodes with down OSDs", func(t *testing.T) {
+		lsOutput = fake.OsdLsOutput(3)
+		treeOutput = fake.OsdTreeOutput(0, 1)
 		assert.False(t, OSDUpdateShouldCheckOkToStop(context, clusterInfo))
 	})
 }

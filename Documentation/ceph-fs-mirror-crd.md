@@ -1,9 +1,12 @@
 ---
-title: FilesystemMirror CRD
+title: Filesystem Mirror CRD
 weight: 3600
 indent: true
 ---
+
 {% include_relative branch.liquid %}
+
+This guide assumes you have created a Rook cluster as explained in the main [Quickstart guide](quickstart.md)
 
 # Ceph FilesystemMirror CRD
 
@@ -24,23 +27,23 @@ metadata:
   namespace: rook-ceph
 ```
 
-### Prerequisites
-
-This guide assumes you have created a Rook cluster as explained in the main [Quickstart guide](ceph-quickstart.md)
-
 ## Settings
 
 If any setting is unspecified, a suitable default will be used automatically.
 
 ### FilesystemMirror metadata
 
-* `name`: The name that will be used for the Ceph cephfs-mirror daemon.
-* `namespace`: The Kubernetes namespace that will be created for the Rook cluster. The services, pods, and other resources created by the operator will be added to this namespace.
+- `name`: The name that will be used for the Ceph cephfs-mirror daemon.
+- `namespace`: The Kubernetes namespace that will be created for the Rook cluster. The services, pods, and other resources created by the operator will be added to this namespace.
 
 ### FilesystemMirror Settings
 
-* `placement`: The cephfs-mirror pods can be given standard Kubernetes placement restrictions with `nodeAffinity`, `tolerations`, `podAffinity`, and `podAntiAffinity` similar to placement defined for daemons configured by the [cluster CRD](https://github.com/rook/rook/blob/{{ branchName }}/cluster/examples/kubernetes/ceph/cluster.yaml).
-* `annotations`: Key value pair list of annotations to add.
-* `labels`: Key value pair list of labels to add.
-* `resources`: The resource requirements for the cephfs-mirror pods.
-* `priorityClassName`: The priority class to set on the cephfs-mirror pods.
+- `placement`: The cephfs-mirror pods can be given standard Kubernetes placement restrictions with `nodeAffinity`, `tolerations`, `podAffinity`, and `podAntiAffinity` similar to placement defined for daemons configured by the [cluster CRD](https://github.com/rook/rook/blob/{{ branchName }}/deploy/examples/cluster.yaml).
+- `annotations`: Key value pair list of annotations to add.
+- `labels`: Key value pair list of labels to add.
+- `resources`: The resource requirements for the cephfs-mirror pods.
+- `priorityClassName`: The priority class to set on the cephfs-mirror pods.
+
+## Configuring mirroring peers
+
+In order to configure mirroring peers, please refer to the [CephFilesystem documentation](ceph-filesystem-crd.md#mirroring).

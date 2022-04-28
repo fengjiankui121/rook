@@ -27,10 +27,11 @@ import (
 
 // CephVersion represents the Ceph version format
 type CephVersion struct {
-	Major int
-	Minor int
-	Extra int
-	Build int
+	Major    int
+	Minor    int
+	Extra    int
+	Build    int
+	CommitID string
 }
 
 const (
@@ -38,25 +39,20 @@ const (
 )
 
 var (
-	// Minimum supported version is 14.2.5
-	Minimum = CephVersion{14, 2, 5, 0}
-	// Nautilus Ceph version
-	Nautilus = CephVersion{14, 0, 0, 0}
+	// Minimum supported version is 15.2.0
+	Minimum = CephVersion{15, 2, 0, 0, ""}
 	// Octopus Ceph version
-	Octopus = CephVersion{15, 0, 0, 0}
+	Octopus = CephVersion{15, 0, 0, 0, ""}
 	// Pacific Ceph version
-	Pacific = CephVersion{16, 0, 0, 0}
+	Pacific = CephVersion{16, 0, 0, 0, ""}
 	// Quincy Ceph version
-	Quincy = CephVersion{17, 0, 0, 0}
-
-	// cephVolumeLVMDiskSortingCephVersion introduced a major regression in c-v and thus is not suitable for production
-	cephVolumeLVMDiskSortingCephVersion = CephVersion{Major: 14, Minor: 2, Extra: 13}
+	Quincy = CephVersion{17, 0, 0, 0, ""}
 
 	// supportedVersions are production-ready versions that rook supports
-	supportedVersions = []CephVersion{Nautilus, Octopus, Pacific}
+	supportedVersions = []CephVersion{Octopus, Pacific, Quincy}
 
 	// unsupportedVersions are possibly Ceph pin-point release that introduced breaking changes and not recommended
-	unsupportedVersions = []CephVersion{cephVolumeLVMDiskSortingCephVersion}
+	unsupportedVersions = []CephVersion{}
 
 	// for parsing the output of `ceph --version`
 	versionPattern = regexp.MustCompile(`ceph version (\d+)\.(\d+)\.(\d+)`)
@@ -64,6 +60,11 @@ var (
 	// For a build release the output is "ceph version 14.2.4-64.el8cp"
 	// So we need to detect the build version change
 	buildVersionPattern = regexp.MustCompile(`ceph version (\d+)\.(\d+)\.(\d+)\-(\d+)`)
+
+	// for parsing the commit hash in the ceph --version output. For example:
+	// input = `ceph version 14.2.11-139 (5c0dc966af809fd1d429ec7bac48962a746af243) nautilus (stable)`
+	// output = [(5c0dc966af809fd1d429ec7bac48962a746af243) 5c0dc966af809fd1d429ec7bac48962a746af243]
+	commitIDPattern = regexp.MustCompile(`\(([^)]+)\)`)
 
 	logger = capnslog.NewPackageLogger("github.com/rook/rook", "cephver")
 )
@@ -82,8 +83,6 @@ func (v *CephVersion) CephVersionFormatted() string {
 // ReleaseName is the name of the Ceph release
 func (v *CephVersion) ReleaseName() string {
 	switch v.Major {
-	case Nautilus.Major:
-		return "nautilus"
 	case Octopus.Major:
 		return "octopus"
 	case Pacific.Major:
@@ -98,37 +97,43 @@ func (v *CephVersion) ReleaseName() string {
 // ExtractCephVersion extracts the major, minor and extra digit of a Ceph release
 func ExtractCephVersion(src string) (*CephVersion, error) {
 	var build int
-	m := versionPattern.FindStringSubmatch(src)
-	if m == nil {
+	var commitID string
+	versionMatch := versionPattern.FindStringSubmatch(src)
+	if versionMatch == nil {
 		return nil, errors.Errorf("failed to parse version from: %q", src)
 	}
 
-	major, err := strconv.Atoi(m[1])
+	major, err := strconv.Atoi(versionMatch[1])
 	if err != nil {
-		return nil, errors.Errorf("failed to parse version major part: %q", m[1])
+		return nil, errors.Errorf("failed to parse version major part: %q", versionMatch[1])
 	}
 
-	minor, err := strconv.Atoi(m[2])
+	minor, err := strconv.Atoi(versionMatch[2])
 	if err != nil {
-		return nil, errors.Errorf("failed to parse version minor part: %q", m[2])
+		return nil, errors.Errorf("failed to parse version minor part: %q", versionMatch[2])
 	}
 
-	extra, err := strconv.Atoi(m[3])
+	extra, err := strconv.Atoi(versionMatch[3])
 	if err != nil {
-		return nil, errors.Errorf("failed to parse version extra part: %q", m[3])
+		return nil, errors.Errorf("failed to parse version extra part: %q", versionMatch[3])
 	}
 
 	// See if we are running on a build release
-	mm := buildVersionPattern.FindStringSubmatch(src)
+	buildVersionMatch := buildVersionPattern.FindStringSubmatch(src)
 	// We don't need to handle any error here, so let's jump in only when "mm" has content
-	if mm != nil {
-		build, err = strconv.Atoi(mm[4])
+	if buildVersionMatch != nil {
+		build, err = strconv.Atoi(buildVersionMatch[4])
 		if err != nil {
-			logger.Warningf("failed to convert version build number part %q to an integer, ignoring", mm[4])
+			logger.Warningf("failed to convert version build number part %q to an integer, ignoring", buildVersionMatch[4])
 		}
 	}
 
-	return &CephVersion{major, minor, extra, build}, nil
+	commitIDMatch := commitIDPattern.FindStringSubmatch(src)
+	if commitIDMatch != nil {
+		commitID = commitIDMatch[1]
+	}
+
+	return &CephVersion{major, minor, extra, build, commitID}, nil
 }
 
 // Supported checks if a given release is supported
@@ -157,11 +162,6 @@ func (v *CephVersion) isRelease(other CephVersion) bool {
 
 func (v *CephVersion) isExactly(other CephVersion) bool {
 	return v.Major == other.Major && v.Minor == other.Minor && v.Extra == other.Extra
-}
-
-// IsNautilus checks if the Ceph version is Nautilus
-func (v *CephVersion) IsNautilus() bool {
-	return v.isRelease(Nautilus)
 }
 
 // IsOctopus checks if the Ceph version is Octopus
@@ -217,18 +217,15 @@ func (v *CephVersion) IsAtLeastOctopus() bool {
 	return v.IsAtLeast(Octopus)
 }
 
-// IsAtLeastNautilus check that the Ceph version is at least Nautilus
-func (v *CephVersion) IsAtLeastNautilus() bool {
-	return v.IsAtLeast(Nautilus)
-}
-
 // IsIdentical checks if Ceph versions are identical
 func IsIdentical(a, b CephVersion) bool {
 	if a.Major == b.Major {
 		if a.Minor == b.Minor {
 			if a.Extra == b.Extra {
 				if a.Build == b.Build {
-					return true
+					if a.CommitID == b.CommitID {
+						return true
+					}
 				}
 			}
 		}
@@ -258,6 +255,9 @@ func IsSuperior(a, b CephVersion) bool {
 		if a.Minor == b.Minor {
 			if a.Extra == b.Extra {
 				if a.Build > b.Build {
+					return true
+				}
+				if a.CommitID != b.CommitID {
 					return true
 				}
 			}
@@ -302,9 +302,9 @@ func IsInferior(a, b CephVersion) bool {
 func ValidateCephVersionsBetweenLocalAndExternalClusters(localVersion, externalVersion CephVersion) error {
 	logger.Debugf("local version is %q, external version is %q", localVersion.String(), externalVersion.String())
 
-	// We only support Nautilus or newer
-	if !externalVersion.IsAtLeastNautilus() {
-		return errors.Errorf("unsupported ceph version %q, need at least nautilus, delete your cluster CR and create a new one with a correct ceph version", externalVersion.String())
+	// We only support Octopus or newer
+	if !externalVersion.IsAtLeastOctopus() {
+		return errors.Errorf("unsupported ceph version %q, need at least octopus, delete your cluster CR and create a new one with a correct ceph version", externalVersion.String())
 	}
 
 	// Identical version, regardless if other CRs are running, it's ok!

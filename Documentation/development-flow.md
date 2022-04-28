@@ -10,9 +10,9 @@ don't hesitate to reach out to us on our [Slack](https://Rook-io.slack.com) dev 
 
 ## Prerequisites
 
-1. [GO 1.13](https://golang.org/dl/) or greater installed
+1. [GO 1.17](https://golang.org/dl/) or greater installed
 2. Git client installed
-3. Github account
+3. GitHub account
 
 ## Initial Setup
 
@@ -38,16 +38,10 @@ cd rook
 
 ### Build
 
+Building Rook-Ceph is simple.
+
 ```console
-# build all rook storage providers
 make
-
-# build a single storage provider, where the IMAGES can be a subdirectory of the "images" folder:
-# "cassandra", "ceph", or "nfs"
-make IMAGES="cassandra" build
-
-# multiple storage providers can also be built
-make IMAGES="cassandra ceph" build
 ```
 
 If you want to use `podman` instead of `docker` then uninstall `docker` packages from your machine, make will automatically pick up `podman`.
@@ -105,11 +99,11 @@ rook
 ├── cluster
 │   ├── charts                    # Helm charts
 │   │   └── rook-ceph
+│   │   └── rook-ceph-cluster
 │   └── examples                  # Sample yaml files for Rook cluster
 │
 ├── cmd                           # Binaries with main entrypoint
 │   ├── rook                      # Main command entry points for operators and daemons
-│   └── rookflex                  # Main command entry points for Rook flexvolume driver
 │
 ├── design                        # Design documents for the various components of the Rook project
 ├── Documentation                 # Rook project Documentation
@@ -119,10 +113,6 @@ rook
 │   ├── apis
 │   │   ├── ceph.rook.io          # ceph specific specs for cluster, file, object
 │   │   │   ├── v1
-│   │   ├── nfs.rook.io           # nfs server specific specs
-│   │   │   └── v1alpha1
-│   │   └── rook.io               # rook.io API group of common types
-│   │       └── v1alpha2
 │   ├── client                    # auto-generated strongly typed client code to access Rook APIs
 │   ├── clusterd
 │   ├── daemon                    # daemons for each storage provider
@@ -132,7 +122,6 @@ rook
 │   │   ├── ceph
 │   │   ├── discover
 │   │   ├── k8sutil
-│   │   ├── nfs
 │   │   └── test
 │   ├── test
 │   ├── util
@@ -143,8 +132,6 @@ rook
     │   ├── installer             # installs Rook and its supported storage providers into integration tests environments
     │   └── utils
     ├── integration               # all test cases that will be invoked during integration testing
-    ├── longhaul                  # longhaul tests
-    ├── pipeline                  # Jenkins pipeline
     └── scripts                   # scripts for setting up integration and manual testing environments
 
 ```
@@ -158,7 +145,6 @@ To add a feature or to make a bug fix, you will need to create a branch in your 
 For new features of significant scope and complexity, a design document is recommended before work begins on the implementation.
 So create a design document if:
 
-* Adding a new storage provider
 * Adding a new CRD
 * Adding a significant feature to an existing storage provider. If the design is simple enough to describe in a github issue, you likely don't need a full design doc.
 
@@ -171,8 +157,8 @@ Authoring a design document for big features has many advantages:
 
 Note that writing code to prototype the feature while working on the design may be very useful to help flesh out the approach.
 
-A design document should be written as a markdown file in the [design folder](/design).
-You can follow the process outlined in the [design template](/design/design_template.md).
+A design document should be written as a markdown file in the [design folder](https://github.com/rook/rook/tree/master/design).
+You can follow the process outlined in the [design template](https://github.com/rook/rook/tree/master/design/design_template.md).
 You will see many examples of previous design documents in that folder.
 Submit a pull request for the design to be discussed and approved by the community before being merged into master, just like any other change to the repository.
 
@@ -216,15 +202,21 @@ Rebasing is a very powerful feature of Git. You need to understand how it works 
 
 ## Submitting a Pull Request
 
-Once you have implemented the feature or bug fix in your branch, you will open a PR to the upstream rook repo. Before opening the PR ensure you have added unit tests, are passing the integration tests, cleaned your commit history, and have rebased on the latest upstream.
+Once you have implemented the feature or bug fix in your branch, you will open a Pull Request (PR)
+to the [upstream Rook repository](https://github.com/rook/rook). Before opening the PR ensure you
+have added unit tests and all unit tests are passing. Please clean your commit history and rebase on
+the latest upstream changes.
+
+See [Unit Tests](#unit-tests) below for instructions on how to run unit tests.
 
 In order to open a pull request (PR) it is required to be up to date with the latest changes upstream. If other commits are pushed upstream before your PR is merged, you will also need to rebase again before it will be merged.
 
 ### Regression Testing
 
-All pull requests must pass the unit and integration tests before they can be merged. These tests automatically
-run as a part of the build process. The results of these tests along with code reviews and other criteria determine whether
-your request will be accepted into the `rook/rook` repo. It is prudent to run all tests locally on your development box prior to submitting a pull request to the `rook/rook` repo.
+All pull requests must pass the unit and integration tests before they can be merged. These tests
+automatically run against every pull request as a part of Rook's continuous integration (CI)
+process. The results of these tests along with code reviews and other criteria determine whether
+your request will be accepted into the `rook/rook` repo.
 
 #### Unit Tests
 
@@ -241,10 +233,38 @@ go test -coverprofile=coverage.out
 go tool cover -html=coverage.out -o coverage.html
 ```
 
+#### Writing unit tests
+
+There is no one-size-fits-all approach to unit testing, but we attempt to provide good tips for
+writing unit tests for Rook below.
+
+Unit tests should help people reading and reviewing the code understand the intended behavior of the
+code.
+
+Good unit tests start with easily testable code. Small chunks ("units") of code can be easily tested
+for every possible input. Higher-level code units that are built from smaller, already-tested units
+can more easily verify that the units are combined together correctly.
+
+Common cases that may need tests:
+* the feature is enabled
+* the feature is disabled
+* the feature is only partially enabled, for every possible way it can be partially enabled
+* every error that can be encountered during execution of the feature
+* the feature can be disabled (including partially) after it was enabled
+* the feature can be modified (including partially) after it was enabled
+* if there is a slice/array involved, test length = 0, length = 1, length = 3, length == max, length > max
+* an input is not specified, for each input
+* an input is specified incorrectly, for each input
+* a resource the code relies on doesn't exist, for each dependency
+
+
 #### Running the Integration Tests
 
-For instructions on how to execute the end to end smoke test suite,
-follow the [test instructions](https://github.com/rook/rook/blob/master/tests/README.md).
+Rook's upstream continuous integration (CI) tests will run integration tests against your changes
+automatically.
+
+You do not need to run these tests locally, but you may if you like. For instructions on how to do
+so, follow the [test instructions](https://github.com/rook/rook/blob/master/tests/README.md).
 
 ### Commit structure
 
@@ -256,7 +276,7 @@ If a feature it is a full description of the new functionality.
 * refer to the issue it's closing, this is mandatory when fixing a bug
 * have a sign-off, this is achieved by adding `-s` when committing so in practice run `git commit -s`. If not the DCO bot will complain.
 If you forgot to add the sign-off you can also amend a previous commit with the sign-off by running `git commit --amend -s`.
-If you've pushed your changes to Github already you'll need to force push your branch with `git push -f`.
+If you've pushed your changes to GitHub already you'll need to force push your branch with `git push -f`.
 
 Here is an example of an acceptable commit message:
 
@@ -270,16 +290,7 @@ Closes: https://github.com/rook/rook/issues/<NUMBER>
 Signed-off-by: First Name Last Name <email address>
 ```
 
-The `component` **MUST** be one of the following:
-- bot
-- build
-- cassandra
-- ceph
-- ci
-- core
-- docs
-- nfs
-- test
+The `component` **MUST** be in the [list checked by the CI](https://github.com/rook/rook/blob/master/.commitlintrc.json).
 
 Note: sometimes you will feel like there is not so much to say, for instance if you are fixing a typo in a text.
 In that case, it is acceptable to shorten the commit message.
@@ -318,18 +329,7 @@ By default, you should always open a pull request against master.
 The flow for getting a fix into a release branch is:
 
 1. Open a PR to merge the changes to master following the process outlined above.
-2. Add the backport label to that PR such as backport-release-1.1
+2. Add the backport label to that PR such as backport-release-1.7
 3. After your PR is merged to master, the mergify bot will automatically open a PR with your commits backported to the release branch
 4. If there are any conflicts you will need to resolve them by pulling the branch, resolving the conflicts and force push back the branch
 5. After the CI is green, the bot will automatically merge the backport PR.
-
-## Debugging operators locally
-
-Operators are meant to be run inside a Kubernetes cluster. However, this makes it harder to use debugging tools and slows down the developer cycle of edit-build-test since testing requires to build a container image, push to the cluster, restart the pods, get logs, etc.
-
-A common operator developer practice is to run the operator locally on the developer machine in order to leverage the developer tools and comfort.
-
-In order to support this external operator mode, rook detects if the operator is running outside of the cluster (using standard cluster env) and changes the behavior as follows:
-
-* Connecting to Kubernetes API will load the config from the user `~/.kube/config`.
-* Instead of the default [CommandExecutor](../pkg/util/exec/exec.go) this mode uses a [TranslateCommandExecutor](../pkg/util/exec/translate_exec.go) that executes every command issued by the operator to run as a Kubernetes job inside the cluster, so that any tools that the operator needs from its image can be called.

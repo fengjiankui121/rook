@@ -30,7 +30,6 @@ import (
 	"github.com/rook/rook/pkg/operator/k8sutil"
 	apps "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
-	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
@@ -43,7 +42,7 @@ const (
 func (c *Cluster) getLabels(monConfig *monConfig, canary, includeNewLabels bool) map[string]string {
 	// Mons have a service for each mon, so the additional pod data is relevant for its services
 	// Use pod labels to keep "mon: id" for legacy
-	labels := controller.CephDaemonAppLabels(AppName, c.Namespace, "mon", monConfig.DaemonName, includeNewLabels)
+	labels := controller.CephDaemonAppLabels(AppName, c.Namespace, config.MonType, monConfig.DaemonName, c.ClusterInfo.NamespacedName().Name, "cephclusters.ceph.rook.io", includeNewLabels)
 	// Add "mon_cluster: <namespace>" for legacy
 	labels[monClusterAttr] = c.Namespace
 	if canary {
@@ -52,7 +51,7 @@ func (c *Cluster) getLabels(monConfig *monConfig, canary, includeNewLabels bool)
 	if includeNewLabels {
 		monVolumeClaimTemplate := c.monVolumeClaimTemplate(monConfig)
 		if monVolumeClaimTemplate != nil {
-			size := monVolumeClaimTemplate.Spec.Resources.Requests[v1.ResourceStorage]
+			size := monVolumeClaimTemplate.Spec.Resources.Requests[corev1.ResourceStorage]
 			labels["pvc_name"] = monConfig.ResourceName
 			labels["pvc_size"] = size.String()
 		}
@@ -303,8 +302,8 @@ func (c *Cluster) makeMonDaemonContainer(monConfig *monConfig) corev1.Container 
 		SecurityContext: controller.PodSecurityContext(),
 		Ports: []corev1.ContainerPort{
 			{
-				Name:          "tcp-msgr1",
-				ContainerPort: monConfig.Port,
+				Name:          "tcp-msgr2",
+				ContainerPort: DefaultMsgr2Port,
 				Protocol:      corev1.ProtocolTCP,
 			},
 		},
@@ -313,12 +312,31 @@ func (c *Cluster) makeMonDaemonContainer(monConfig *monConfig) corev1.Container 
 			k8sutil.PodIPEnvVar(podIPEnvVar),
 		),
 		Resources:     cephv1.GetMonResources(c.spec.Resources),
+		StartupProbe:  controller.GenerateStartupProbeExecDaemon(config.MonType, monConfig.DaemonName),
 		LivenessProbe: controller.GenerateLivenessProbeExecDaemon(config.MonType, monConfig.DaemonName),
 		WorkingDir:    config.VarLogCephDir,
 	}
 
-	// If the liveness probe is enabled
-	container = config.ConfigureLivenessProbe(cephv1.KeyMon, container, c.spec.HealthCheck)
+	if !c.spec.RequireMsgr2() {
+		// Add messenger 1 port
+		container.Ports = append(container.Ports, corev1.ContainerPort{
+			Name:          "tcp-msgr1",
+			ContainerPort: DefaultMsgr1Port,
+			Protocol:      corev1.ProtocolTCP,
+		})
+	}
+
+	if monConfig.Zone != "" {
+		desiredLocation := fmt.Sprintf("%s=%s", c.stretchFailureDomainName(), monConfig.Zone)
+		container.Args = append(container.Args, []string{"--set-crush-location", desiredLocation}...)
+		if monConfig.Zone == c.getArbiterZone() {
+			// remember the arbiter mon to be set later in the reconcile after the OSDs are configured
+			c.arbiterMon = monConfig.DaemonName
+		}
+	}
+
+	container = config.ConfigureStartupProbe(container, c.spec.HealthCheck.StartupProbe[cephv1.KeyMon])
+	container = config.ConfigureLivenessProbe(container, c.spec.HealthCheck.LivenessProbe[cephv1.KeyMon])
 
 	// If host networking is enabled, we don't need a bind addr that is different from the public addr
 	if !c.spec.Network.IsHost() {
@@ -327,9 +345,6 @@ func (c *Cluster) makeMonDaemonContainer(monConfig *monConfig) corev1.Container 
 		container.Args = append(container.Args,
 			config.NewFlag("public-bind-addr", controller.ContainerEnvVarReference(podIPEnvVar)))
 	}
-
-	// Add messenger 2 port
-	addContainerPort(container, "tcp-msgr2", 3300)
 
 	return container
 }
@@ -361,7 +376,7 @@ func UpdateCephDeploymentAndWait(context *clusterd.Context, clusterInfo *client.
 			err := client.OkToContinue(context, clusterInfo, deployment.Name, daemonType, daemonName)
 			if err != nil {
 				if continueUpgradeAfterChecksEvenIfNotHealthy {
-					logger.Infof("The %s daemon %s is not ok-to-stop but 'continueUpgradeAfterChecksEvenIfNotHealthy' is true, so continuing...", daemonType, daemonName)
+					logger.Infof("The %s daemon %s is not ok-to-continue but 'continueUpgradeAfterChecksEvenIfNotHealthy' is true, so continuing...", daemonType, daemonName)
 					return nil
 				}
 				return errors.Wrapf(err, "failed to check if we can %s the deployment %s", action, deployment.Name)
@@ -371,6 +386,6 @@ func UpdateCephDeploymentAndWait(context *clusterd.Context, clusterInfo *client.
 		return nil
 	}
 
-	err := k8sutil.UpdateDeploymentAndWait(context, deployment, clusterInfo.Namespace, callback)
+	err := k8sutil.UpdateDeploymentAndWait(clusterInfo.Context, context, deployment, clusterInfo.Namespace, callback)
 	return err
 }

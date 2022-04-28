@@ -23,11 +23,11 @@ import (
 	"path/filepath"
 	"strconv"
 
-	"github.com/libopenstorage/secrets"
 	"github.com/pkg/errors"
 	cephv1 "github.com/rook/rook/pkg/apis/ceph.rook.io/v1"
 	kms "github.com/rook/rook/pkg/daemon/ceph/osd/kms"
 	opconfig "github.com/rook/rook/pkg/operator/ceph/config"
+	cephkey "github.com/rook/rook/pkg/operator/ceph/config/keyring"
 	"github.com/rook/rook/pkg/operator/ceph/controller"
 	"github.com/rook/rook/pkg/operator/k8sutil"
 	apps "k8s.io/api/apps/v1"
@@ -79,6 +79,9 @@ OSD_STORE_FLAG="%s"
 OSD_DATA_DIR=/var/lib/ceph/osd/ceph-"$OSD_ID"
 CV_MODE=%s
 DEVICE="$%s"
+
+# create new keyring
+ceph -n client.admin auth get-or-create osd."$OSD_ID" mon 'allow profile osd' mgr 'allow profile osd' osd 'allow *' -k /etc/ceph/admin-keyring-store/keyring
 
 # active the osd with ceph-volume
 if [[ "$CV_MODE" == "lvm" ]]; then
@@ -190,76 +193,6 @@ else
 	echo "LUKS version is not 2 so not setting label and subsystem"
 fi
 `
-	// #nosec G101 no leak just variable names
-	getKEKFromVaultWithToken = `
-# DO NOT RUN WITH -x TO AVOID LEAKING VAULT_TOKEN
-set -e
-
-KEK_NAME=%s
-KEY_PATH=%s
-CURL_PAYLOAD=$(mktemp)
-ARGS=(--silent --show-error --request GET --header "X-Vault-Token: ${VAULT_TOKEN//[$'\t\r\n']}")
-PYTHON_DATA_PARSE="['data']"
-
-# If a vault namespace is set
-if [ -n "$VAULT_NAMESPACE" ]; then
-  ARGS+=(--header "X-Vault-Namespace: ${VAULT_NAMESPACE}")
-fi
-
-# If SSL is configured but self-signed CA is used
-if [ -n "$VAULT_SKIP_VERIFY" ] && [[ "$VAULT_SKIP_VERIFY" == "true" ]]; then
-  ARGS+=(--insecure)
-fi
-
-# TLS args
-if [ -n "$VAULT_CACERT" ]; then
-  ARGS+=(--capath $(dirname "${VAULT_CACERT}"))
-fi
-if [ -n "$VAULT_CLIENT_CERT" ]; then
-  ARGS+=(--cert "${VAULT_CLIENT_CERT}")
-fi
-if [ -n "$VAULT_CLIENT_KEY" ]; then
-  ARGS+=(--key "${VAULT_CLIENT_KEY}")
-fi
-
-# For a request to any host/port, connect to VAULT_TLS_SERVER_NAME:requests original port instead
-# Used for SNI validation and correct certificate matching
-if [ -n "$VAULT_TLS_SERVER_NAME" ]; then
-  ARGS+=(--connect-to ::"${VAULT_TLS_SERVER_NAME}":)
-fi
-
-# trim VAULT_BACKEND_PATH for last character '/' to avoid a redirect response from the server
-VAULT_BACKEND_PATH="${VAULT_BACKEND_PATH%%/}"
-
-# Check KV engine version
-if [[ "$VAULT_BACKEND" == "v2" ]]; then
-  PYTHON_DATA_PARSE="['data']['data']"
-  VAULT_BACKEND_PATH="$VAULT_BACKEND_PATH/data"
-fi
-
-
-# Get the Key Encryption Key
-curl "${ARGS[@]}" "$VAULT_ADDR"/v1/"$VAULT_BACKEND_PATH"/"$KEK_NAME" > "$CURL_PAYLOAD"
-
-# Check for warnings in the payload
-if python3 -c "import sys, json; print(json.load(sys.stdin)[\"warnings\"], end='')" 2> /dev/null < "$CURL_PAYLOAD"; then
-  # We could get a warning but it is not necessary an issue, so if there is no key we exit
-  if ! python3 -c "import sys, json; print(json.load(sys.stdin)${PYTHON_DATA_PARSE}[\"$KEK_NAME\"], end='')" 2> /dev/null < "$CURL_PAYLOAD"; then
-    exit 1
-  fi
-fi
-
-# Check for errors in the payload
-if python3 -c "import sys, json; print(json.load(sys.stdin)[\"errors\"], end='')" 2> /dev/null < "$CURL_PAYLOAD"; then
-  exit 1
-fi
-
-# Put the KEK in a file for cryptsetup to read
-python3 -c "import sys, json; print(json.load(sys.stdin)${PYTHON_DATA_PARSE}[\"$KEK_NAME\"], end='')" < "$CURL_PAYLOAD" > "$KEY_PATH"
-
-# purge payload file
-rm -f "$CURL_PAYLOAD"
-`
 
 	// If the disk identifier changes (different major and minor) we must force copy
 	// --remove-destination will remove each existing destination file before attempting to open it
@@ -300,7 +233,7 @@ var defaultTuneFastSettings = []string{
 	"--osd-delete-sleep=0",                        // Time in seconds to sleep before next removal transaction for SSDs
 	"--bluestore-min-alloc-size=4096",             // Default min_alloc_size value for SSDs
 	"--bluestore-prefer-deferred-size=0",          // Default value of bluestore_prefer_deferred_size for SSDs
-	"--bluestore-compression-min-blob-size=8912",  // Default value of bluestore_compression_min_blob_size for SSDs
+	"--bluestore-compression-min-blob-size=8192",  // Default value of bluestore_compression_min_blob_size for SSDs
 	"--bluestore-compression-max-blob-size=65536", // Default value of bluestore_compression_max_blob_size for SSDs
 	"--bluestore-max-blob-size=65536",             // Default value of bluestore_max_blob_size for SSDs
 	"--bluestore-cache-size=3221225472",           // Default value of bluestore_cache_size for SSDs
@@ -334,7 +267,7 @@ func (c *Cluster) makeDeployment(osdProps osdProperties, osd OSDInfo, provisionC
 	volumes := controller.PodVolumes(provisionConfig.DataPathMap, dataDirHostPath, false)
 	failureDomainValue := osdProps.crushHostname
 	doConfigInit := true     // initialize ceph.conf in init container?
-	doBinaryCopyInit := true // copy tini and rook binaries in an init container?
+	doBinaryCopyInit := true // copy rook binary in an init container?
 
 	// This property is used for both PVC and non-PVC use case
 	if osd.CVMode == "" {
@@ -343,8 +276,8 @@ func (c *Cluster) makeDeployment(osdProps osdProperties, osd OSDInfo, provisionC
 
 	dataDir := k8sutil.DataDir
 	// Create volume config for /dev so the pod can access devices on the host
-	// Only valid when running OSD with LVM and Raw mode
-	if !osdProps.onPVC() {
+	// Only valid when running OSD on device or OSD on LV-backed PVC
+	if !osdProps.onPVC() || osd.CVMode == "lvm" {
 		devVolume := v1.Volume{Name: "devices", VolumeSource: v1.VolumeSource{HostPath: &v1.HostPathVolumeSource{Path: "/dev"}}}
 		volumes = append(volumes, devVolume)
 		devMount := v1.VolumeMount{Name: "devices", MountPath: "/dev"}
@@ -354,7 +287,7 @@ func (c *Cluster) makeDeployment(osdProps osdProperties, osd OSDInfo, provisionC
 	// If the OSD runs on PVC
 	if osdProps.onPVC() {
 		// Create volume config for PVCs
-		volumes = append(volumes, getPVCOSDVolumes(&osdProps, c.context.ConfigDir, c.clusterInfo.Namespace, false)...)
+		volumes = append(volumes, getPVCOSDVolumes(&osdProps, c.spec.DataDirHostPath, c.clusterInfo.Namespace, false)...)
 		// If encrypted let's add the secret key mount path
 		if osdProps.encrypted && osd.CVMode == "raw" {
 			encryptedVol, _ := c.getEncryptionVolume(osdProps)
@@ -363,7 +296,7 @@ func (c *Cluster) makeDeployment(osdProps osdProperties, osd OSDInfo, provisionC
 			// Somehow when this happens and we try to update a deployment spec it fails with:
 			//  ValidationError(Pod.spec.volumes[7].projected): missing required field "sources"
 			if c.spec.Security.KeyManagementService.IsEnabled() && c.spec.Security.KeyManagementService.IsTLSEnabled() {
-				encryptedVol, _ := kms.VaultVolumeAndMount(c.spec.Security.KeyManagementService.ConnectionDetails)
+				encryptedVol, _ := kms.VaultVolumeAndMount(c.spec.Security.KeyManagementService.ConnectionDetails, "")
 				volumes = append(volumes, encryptedVol)
 			}
 		}
@@ -374,10 +307,7 @@ func (c *Cluster) makeDeployment(osdProps osdProperties, osd OSDInfo, provisionC
 	}
 
 	osdID := strconv.Itoa(osd.ID)
-	tiniEnvVar := v1.EnvVar{Name: "TINI_SUBREAPER", Value: ""}
-	envVars := append(c.getConfigEnvVars(osdProps, dataDir), []v1.EnvVar{
-		tiniEnvVar,
-	}...)
+	envVars := c.getConfigEnvVars(osdProps, dataDir)
 	envVars = append(envVars, k8sutil.ClusterDaemonEnvVars(c.spec.CephVersion.Image)...)
 	envVars = append(envVars, []v1.EnvVar{
 		{Name: "ROOK_OSD_UUID", Value: osd.UUID},
@@ -393,7 +323,6 @@ func (c *Cluster) makeDeployment(osdProps osdProperties, osd OSDInfo, provisionC
 		dataDeviceClassEnvVar(osd.DeviceClass),
 	}...)
 	configEnvVars := append(c.getConfigEnvVars(osdProps, dataDir), []v1.EnvVar{
-		tiniEnvVar,
 		{Name: "ROOK_OSD_ID", Value: osdID},
 		{Name: "ROOK_CEPH_VERSION", Value: c.clusterInfo.CephVersion.CephVersionFormatted()},
 		{Name: "ROOK_IS_DEVICE", Value: "true"},
@@ -405,9 +334,9 @@ func (c *Cluster) makeDeployment(osdProps osdProperties, osd OSDInfo, provisionC
 	// If the OSD was prepared with ceph-volume and running on PVC and using the LVM mode
 	if osdProps.onPVC() && osd.CVMode == "lvm" {
 		// if the osd was provisioned by ceph-volume, we need to launch it with rook as the parent process
-		command = []string{path.Join(rookBinariesMountPath, "tini")}
+		command = []string{path.Join(rookBinariesMountPath, "rook")}
 		args = []string{
-			"--", path.Join(rookBinariesMountPath, "rook"),
+			path.Join(rookBinariesMountPath, "rook"),
 			"ceph", "osd", "start",
 			"--",
 			"--foreground",
@@ -489,9 +418,9 @@ func (c *Cluster) makeDeployment(osdProps osdProperties, osd OSDInfo, provisionC
 	// so that it can pick the already mounted/activated osd metadata path
 	// This container will activate the OSD and place the activated filesinto an empty dir
 	// The empty dir will be shared by the "activate-osd" pod and the "osd" main pod
-	activateOSDVolume, activateOSDContainer := c.getActivateOSDInitContainer(c.context.ConfigDir, c.clusterInfo.Namespace, osdID, osd, osdProps)
+	activateOSDVolume, activateOSDContainer := c.getActivateOSDInitContainer(c.spec.DataDirHostPath, c.clusterInfo.Namespace, osdID, osd, osdProps)
 	if !osdProps.onPVC() {
-		volumes = append(volumes, activateOSDVolume)
+		volumes = append(volumes, activateOSDVolume...)
 		volumeMounts = append(volumeMounts, activateOSDContainer.VolumeMounts[0])
 	}
 
@@ -537,6 +466,7 @@ func (c *Cluster) makeDeployment(osdProps osdProperties, osd OSDInfo, provisionC
 				Image:           c.rookVersion,
 				VolumeMounts:    configVolumeMounts,
 				Env:             configEnvVars,
+				EnvFrom:         getEnvFromSources(),
 				SecurityContext: securityContext,
 			})
 	}
@@ -620,8 +550,10 @@ func (c *Cluster) makeDeployment(osdProps osdProperties, osd OSDInfo, provisionC
 					Image:           c.spec.CephVersion.Image,
 					VolumeMounts:    volumeMounts,
 					Env:             envVars,
+					EnvFrom:         getEnvFromSources(),
 					Resources:       osdProps.resources,
 					SecurityContext: securityContext,
+					StartupProbe:    controller.GenerateStartupProbeExecDaemon(opconfig.OsdType, osdID),
 					LivenessProbe:   controller.GenerateLivenessProbeExecDaemon(opconfig.OsdType, osdID),
 					WorkingDir:      opconfig.VarLogCephDir,
 				},
@@ -641,8 +573,8 @@ func (c *Cluster) makeDeployment(osdProps osdProperties, osd OSDInfo, provisionC
 		podTemplateSpec.Spec.Containers = append(podTemplateSpec.Spec.Containers, *controller.LogCollectorContainer(fmt.Sprintf("ceph-osd.%s", osdID), c.clusterInfo.Namespace, c.spec))
 	}
 
-	// If the liveness probe is enabled
-	podTemplateSpec.Spec.Containers[0] = opconfig.ConfigureLivenessProbe(cephv1.KeyOSD, podTemplateSpec.Spec.Containers[0], c.spec.HealthCheck)
+	podTemplateSpec.Spec.Containers[0] = opconfig.ConfigureStartupProbe(podTemplateSpec.Spec.Containers[0], c.spec.HealthCheck.StartupProbe[cephv1.KeyOSD])
+	podTemplateSpec.Spec.Containers[0] = opconfig.ConfigureLivenessProbe(podTemplateSpec.Spec.Containers[0], c.spec.HealthCheck.LivenessProbe[cephv1.KeyOSD])
 
 	if c.spec.Network.IsHost() {
 		podTemplateSpec.Spec.DNSPolicy = v1.DNSClusterFirstWithHostNet
@@ -702,17 +634,13 @@ func (c *Cluster) makeDeployment(osdProps osdProperties, osd OSDInfo, provisionC
 	}
 
 	if osdProps.onPVC() {
-		// the "all" placement is applied separately so it will have lower priority.
-		// We want placement from the storageClassDeviceSet to be applied and override
-		// the "all" placement if there are any overlapping placement settings.
-		c.spec.Placement.All().ApplyToPodSpec(&deployment.Spec.Template.Spec)
-		// apply storageClassDeviceSet Placement
-		// If nodeAffinity is specified both in the device set and "all" placement,
-		// they will be merged.
+		c.applyAllPlacementIfNeeded(&deployment.Spec.Template.Spec)
+		// apply storageClassDeviceSets.Placement
 		osdProps.placement.ApplyToPodSpec(&deployment.Spec.Template.Spec)
 	} else {
-		p := cephv1.GetOSDPlacement(c.spec.Placement)
-		p.ApplyToPodSpec(&deployment.Spec.Template.Spec)
+		c.applyAllPlacementIfNeeded(&deployment.Spec.Template.Spec)
+		// apply c.spec.Placement.osd
+		c.spec.Placement[cephv1.KeyOSD].ApplyToPodSpec(&deployment.Spec.Template.Spec)
 	}
 
 	// portable OSDs must have affinity to the topology where the osd prepare job was executed
@@ -732,6 +660,22 @@ func (c *Cluster) makeDeployment(osdProps osdProperties, osd OSDInfo, provisionC
 	return deployment, nil
 }
 
+// applyAllPlacementIfNeeded apply spec.placement.all if OnlyApplyOSDPlacement set to false
+func (c *Cluster) applyAllPlacementIfNeeded(d *v1.PodSpec) {
+	// The placement for OSDs is computed from several different places:
+	// - For non-PVCs: `placement.all` and `placement.osd`
+	// - For PVCs: `placement.all` and inside the storageClassDeviceSet from the `placement` or `preparePlacement`
+
+	// The placement from these sources will be merged by default (if onlyApplyOSDPlacement is false) in case of NodeAffinity and toleration,
+	// in case of other placement rule like PodAffinity, PodAntiAffinity... it will override last placement with the current placement applied,
+	// See ApplyToPodSpec().
+
+	// apply spec.placement.all when spec.Storage.OnlyApplyOSDPlacement is false
+	if !c.spec.Storage.OnlyApplyOSDPlacement {
+		c.spec.Placement.All().ApplyToPodSpec(d)
+	}
+}
+
 func applyTopologyAffinity(spec *v1.PodSpec, osd OSDInfo) error {
 	if osd.TopologyAffinity == "" {
 		logger.Debugf("no topology affinity to set for osd %d", osd.ID)
@@ -749,8 +693,8 @@ func applyTopologyAffinity(spec *v1.PodSpec, osd OSDInfo) error {
 	return nil
 }
 
-// To get rook inside the container, the config init container needs to copy "tini" and "rook" binaries into a volume.
-// Get the config flag so rook will copy the binaries and create the volume and mount that will be shared between
+// To get rook inside the container, the config init container needs to copy "rook" binary into a volume.
+// Get the config flag so rook will copy the binary and create the volume and mount that will be shared between
 // the init container and the daemon container
 func (c *Cluster) getCopyBinariesContainer() (v1.Volume, *v1.Container) {
 	volume := v1.Volume{Name: rookBinariesVolumeName, VolumeSource: v1.VolumeSource{EmptyDir: &v1.EmptyDirVolumeSource{}}}
@@ -767,8 +711,9 @@ func (c *Cluster) getCopyBinariesContainer() (v1.Volume, *v1.Container) {
 }
 
 // This container runs all the actions needed to activate an OSD before we can run the OSD process
-func (c *Cluster) getActivateOSDInitContainer(configDir, namespace, osdID string, osdInfo OSDInfo, osdProps osdProperties) (v1.Volume, *v1.Container) {
+func (c *Cluster) getActivateOSDInitContainer(configDir, namespace, osdID string, osdInfo OSDInfo, osdProps osdProperties) ([]v1.Volume, *v1.Container) {
 	// We need to use hostPath because the same reason as written in the comment of getDataBridgeVolumeSource()
+
 	hostPathType := v1.HostPathDirectoryOrCreate
 	source := v1.VolumeSource{
 		HostPath: &v1.HostPathVolumeSource{
@@ -780,10 +725,16 @@ func (c *Cluster) getActivateOSDInitContainer(configDir, namespace, osdID string
 			Type: &hostPathType,
 		},
 	}
-	volume := v1.Volume{
-		Name:         activateOSDVolumeName,
-		VolumeSource: source,
+	volume := []v1.Volume{
+		{
+			Name:         activateOSDVolumeName,
+			VolumeSource: source,
+		},
 	}
+
+	adminKeyringVol, adminKeyringVolMount := cephkey.Volume().Admin(), cephkey.VolumeMount().Admin()
+	volume = append(volume, adminKeyringVol)
+
 	envVars := append(
 		osdActivateEnvVar(),
 		blockPathEnvVariable(osdInfo.BlockPath),
@@ -801,6 +752,7 @@ func (c *Cluster) getActivateOSDInitContainer(configDir, namespace, osdID string
 		{Name: "devices", MountPath: "/dev"},
 		{Name: k8sutil.ConfigOverrideName, ReadOnly: true, MountPath: opconfig.EtcCephDir},
 	}
+	volMounts = append(volMounts, adminKeyringVolMount)
 
 	if osdProps.onPVC() {
 		volMounts = append(volMounts, getPvcOSDBridgeMount(osdProps.pvc.ClaimName))
@@ -815,12 +767,29 @@ func (c *Cluster) getActivateOSDInitContainer(configDir, namespace, osdID string
 		Name:            "activate",
 		Image:           c.spec.CephVersion.Image,
 		VolumeMounts:    volMounts,
-		SecurityContext: PrivilegedContext(),
+		SecurityContext: controller.PrivilegedContext(true),
 		Env:             envVars,
+		EnvFrom:         getEnvFromSources(),
 		Resources:       osdProps.resources,
 	}
 
 	return volume, container
+}
+
+// The blockdevmapper container copies the device node file, which is regarded as a device special file.
+// To be able to perform this action, the CAP_MKNOD capability is required.
+// Provide a securityContext which requests the MKNOD capability for the container to function properly.
+func getBlockDevMapperContext() *v1.SecurityContext {
+	privileged := controller.HostPathRequiresPrivileged()
+
+	return &v1.SecurityContext{
+		Capabilities: &v1.Capabilities{
+			Add: []v1.Capability{
+				"MKNOD",
+			},
+		},
+		Privileged: &privileged,
+	}
 }
 
 // Currently we can't mount a block mode pv directly to a privileged container
@@ -842,7 +811,7 @@ func (c *Cluster) getPVCInitContainer(osdProps osdProperties) v1.Container {
 			},
 		},
 		VolumeMounts:    []v1.VolumeMount{getPvcOSDBridgeMount(osdProps.pvc.ClaimName)},
-		SecurityContext: controller.PodSecurityContext(),
+		SecurityContext: getBlockDevMapperContext(),
 		Resources:       osdProps.resources,
 	}
 }
@@ -874,7 +843,7 @@ func (c *Cluster) getPVCInitContainerActivate(mountPath string, osdProps osdProp
 			},
 		},
 		VolumeMounts:    []v1.VolumeMount{getPvcOSDBridgeMountActivate(mountPath, osdProps.pvc.ClaimName)},
-		SecurityContext: controller.PodSecurityContext(),
+		SecurityContext: getBlockDevMapperContext(),
 		Resources:       osdProps.resources,
 	}
 }
@@ -891,21 +860,28 @@ func (c *Cluster) generateEncryptionOpenBlockContainer(resources v1.ResourceRequ
 			fmt.Sprintf(openEncryptedBlock, c.clusterInfo.FSID, pvcName, encryptionKeyPath(), encryptionBlockDestinationCopy(mountPath, blockType), encryptionDMName(pvcName, cryptBlockType), encryptionDMPath(pvcName, cryptBlockType)),
 		},
 		VolumeMounts:    []v1.VolumeMount{getPvcOSDBridgeMountActivate(mountPath, volumeMountPVCName), getDeviceMapperMount()},
-		SecurityContext: PrivilegedContext(),
+		SecurityContext: controller.PrivilegedContext(true),
 		Resources:       resources,
 	}
 }
 
 func (c *Cluster) generateVaultGetKEK(osdProps osdProperties) v1.Container {
+	keyName := osdProps.pvc.ClaimName
+	keyPath := encryptionKeyPath()
+	envVars := c.getConfigEnvVars(osdProps, "")
+	envVars = append(envVars, kms.ConfigToEnvVar(c.spec)...)
+
 	return v1.Container{
-		Name:  blockEncryptionKMSGetKEKInitContainer,
-		Image: c.spec.CephVersion.Image,
-		Command: []string{
-			"/bin/bash",
-			"-c",
-			fmt.Sprintf(getKEKFromVaultWithToken, kms.GenerateOSDEncryptionSecretName(osdProps.pvc.ClaimName), encryptionKeyPath()),
+		Name:    blockEncryptionKMSGetKEKInitContainer,
+		Image:   c.rookVersion,
+		Command: []string{"rook"},
+		Args: []string{
+			"key-management",
+			"get",
+			keyName,
+			keyPath,
 		},
-		Env:       kms.VaultConfigToEnvVar(c.spec),
+		Env:       envVars,
 		Resources: osdProps.resources,
 	}
 }
@@ -915,26 +891,21 @@ func (c *Cluster) getPVCEncryptionOpenInitContainerActivate(mountPath string, os
 
 	// If a KMS is enabled we need to add an init container to fetch the KEK
 	if c.spec.Security.KeyManagementService.IsEnabled() {
-		kmsProvider := kms.GetParam(c.spec.Security.KeyManagementService.ConnectionDetails, kms.Provider)
-		// Get Vault KEK from KMS container
-		if kmsProvider == secrets.TypeVault {
-			if c.spec.Security.KeyManagementService.IsTokenAuthEnabled() {
-				getKEKFromKMSContainer := c.generateVaultGetKEK(osdProps)
+		getKEKFromKMSContainer := c.generateVaultGetKEK(osdProps)
 
-				// Volume mount to store the encrypted key
-				_, volMount := c.getEncryptionVolume(osdProps)
-				getKEKFromKMSContainer.VolumeMounts = append(getKEKFromKMSContainer.VolumeMounts, volMount)
+		// Volume mount to store the encrypted key
+		_, volMount := c.getEncryptionVolume(osdProps)
+		getKEKFromKMSContainer.VolumeMounts = append(getKEKFromKMSContainer.VolumeMounts, volMount)
 
-				// Now let's see if there is a TLS config we need to mount as well
-				if c.spec.Security.KeyManagementService.IsTLSEnabled() {
-					_, vaultVolMount := kms.VaultVolumeAndMount(c.spec.Security.KeyManagementService.ConnectionDetails)
-					getKEKFromKMSContainer.VolumeMounts = append(getKEKFromKMSContainer.VolumeMounts, vaultVolMount)
-				}
-
-				// Add the container to the list of containers
-				containers = append(containers, getKEKFromKMSContainer)
+		if c.spec.Security.KeyManagementService.IsVaultKMS() {
+			// Now let's see if there is a TLS config we need to mount as well
+			if c.spec.Security.KeyManagementService.IsTLSEnabled() {
+				_, vaultVolMount := kms.VaultVolumeAndMount(c.spec.Security.KeyManagementService.ConnectionDetails, "")
+				getKEKFromKMSContainer.VolumeMounts = append(getKEKFromKMSContainer.VolumeMounts, vaultVolMount)
 			}
 		}
+		// Add the container to the list of containers
+		containers = append(containers, getKEKFromKMSContainer)
 	}
 
 	// Main block container
@@ -976,7 +947,7 @@ func (c *Cluster) generateEncryptionCopyBlockContainer(resources v1.ResourceRequ
 		// volumeMountPVCName is crucial, especially when the block we copy is the metadata block
 		// its value must be the name of the block PV so that all init containers use the same bridge (the emptyDir shared by all the init containers)
 		VolumeMounts:    []v1.VolumeMount{getPvcOSDBridgeMountActivate(mountPath, volumeMountPVCName), getDeviceMapperMount()},
-		SecurityContext: controller.PodSecurityContext(),
+		SecurityContext: getBlockDevMapperContext(),
 		Resources:       resources,
 	}
 }
@@ -1023,7 +994,7 @@ func (c *Cluster) getPVCMetadataInitContainer(mountPath string, osdProps osdProp
 				Name:      fmt.Sprintf("%s-bridge", osdProps.metadataPVC.ClaimName),
 			},
 		},
-		SecurityContext: controller.PodSecurityContext(),
+		SecurityContext: getBlockDevMapperContext(),
 		Resources:       osdProps.resources,
 	}
 }
@@ -1057,7 +1028,7 @@ func (c *Cluster) getPVCMetadataInitContainerActivate(mountPath string, osdProps
 		// We need to call getPvcOSDBridgeMountActivate() so that we can copy the metadata block into the "main" empty dir
 		// This empty dir is passed along every init container
 		VolumeMounts:    []v1.VolumeMount{getPvcOSDBridgeMountActivate(mountPath, osdProps.pvc.ClaimName)},
-		SecurityContext: controller.PodSecurityContext(),
+		SecurityContext: getBlockDevMapperContext(),
 		Resources:       osdProps.resources,
 	}
 }
@@ -1083,7 +1054,7 @@ func (c *Cluster) getPVCWalInitContainer(mountPath string, osdProps osdPropertie
 				Name:      fmt.Sprintf("%s-bridge", osdProps.walPVC.ClaimName),
 			},
 		},
-		SecurityContext: controller.PodSecurityContext(),
+		SecurityContext: getBlockDevMapperContext(),
 		Resources:       osdProps.resources,
 	}
 }
@@ -1117,7 +1088,7 @@ func (c *Cluster) getPVCWalInitContainerActivate(mountPath string, osdProps osdP
 		// We need to call getPvcOSDBridgeMountActivate() so that we can copy the wal block into the "main" empty dir
 		// This empty dir is passed along every init container
 		VolumeMounts:    []v1.VolumeMount{getPvcOSDBridgeMountActivate(mountPath, osdProps.pvc.ClaimName)},
-		SecurityContext: controller.PodSecurityContext(),
+		SecurityContext: getBlockDevMapperContext(),
 		Resources:       osdProps.resources,
 	}
 }
@@ -1140,7 +1111,7 @@ func (c *Cluster) getActivatePVCInitContainer(osdProps osdProperties, osdID stri
 			},
 		},
 		VolumeMounts:    []v1.VolumeMount{getPvcOSDBridgeMountActivate(osdDataPath, osdProps.pvc.ClaimName)},
-		SecurityContext: PrivilegedContext(),
+		SecurityContext: controller.PrivilegedContext(true),
 		Resources:       osdProps.resources,
 	}
 
@@ -1168,7 +1139,7 @@ func (c *Cluster) getExpandPVCInitContainer(osdProps osdProperties, osdID string
 		},
 		Args:            []string{"bluefs-bdev-expand", "--path", osdDataPath},
 		VolumeMounts:    []v1.VolumeMount{getPvcOSDBridgeMountActivate(osdDataPath, osdProps.pvc.ClaimName)},
-		SecurityContext: PrivilegedContext(),
+		SecurityContext: controller.PrivilegedContext(true),
 		Resources:       osdProps.resources,
 	}
 }
@@ -1195,7 +1166,7 @@ func (c *Cluster) getExpandEncryptedPVCInitContainer(mountPath string, osdProps 
 		},
 		Args:            []string{"--verbose", "resize", encryptionDMName(osdProps.pvc.ClaimName, DmcryptBlockType)},
 		VolumeMounts:    volMount,
-		SecurityContext: PrivilegedContext(),
+		SecurityContext: controller.PrivilegedContext(true),
 		Resources:       osdProps.resources,
 	}
 }
@@ -1225,7 +1196,7 @@ func (c *Cluster) getEncryptedStatusPVCInitContainer(mountPath string, osdProps 
 		},
 		Args:            []string{"--verbose", "status", encryptionDMName(osdProps.pvc.ClaimName, DmcryptBlockType)},
 		VolumeMounts:    []v1.VolumeMount{getPvcOSDBridgeMountActivate(mountPath, osdProps.pvc.ClaimName)},
-		SecurityContext: PrivilegedContext(),
+		SecurityContext: controller.PrivilegedContext(true),
 		Resources:       osdProps.resources,
 	}
 }

@@ -21,9 +21,8 @@ import (
 	"fmt"
 
 	"github.com/pkg/errors"
-	cephv1 "github.com/rook/rook/pkg/apis/ceph.rook.io/v1"
 	"github.com/rook/rook/pkg/clusterd"
-	"github.com/rook/rook/pkg/operator/ceph/config"
+	cephconfig "github.com/rook/rook/pkg/operator/ceph/config"
 	"github.com/rook/rook/pkg/operator/ceph/controller"
 	"github.com/rook/rook/pkg/operator/k8sutil"
 	apps "k8s.io/api/apps/v1"
@@ -37,13 +36,15 @@ const (
 	// MDS cache memory limit should be set to 50-60% of RAM reserved for the MDS container
 	// MDS uses approximately 125% of the value of mds_cache_memory_limit in RAM.
 	// Eventually we will tune this automatically: http://tracker.ceph.com/issues/36663
-	mdsCacheMemoryLimitFactor = 0.5
+	mdsCacheMemoryLimitFactor    = 0.5
+	mdsCacheMemoryResourceFactor = 0.8
 )
 
 func (c *Cluster) makeDeployment(mdsConfig *mdsConfig, namespace string) (*apps.Deployment, error) {
 
 	mdsContainer := c.makeMdsDaemonContainer(mdsConfig)
-	mdsContainer = config.ConfigureLivenessProbe(cephv1.KeyMds, mdsContainer, c.clusterSpec.HealthCheck)
+	mdsContainer = cephconfig.ConfigureStartupProbe(mdsContainer, c.fs.Spec.MetadataServer.StartupProbe)
+	mdsContainer = cephconfig.ConfigureLivenessProbe(mdsContainer, c.fs.Spec.MetadataServer.LivenessProbe)
 
 	podSpec := v1.PodTemplateSpec{
 		ObjectMeta: metav1.ObjectMeta{
@@ -132,7 +133,7 @@ func (c *Cluster) makeMdsDaemonContainer(mdsConfig *mdsConfig) v1.Container {
 
 	if !c.clusterSpec.Network.IsHost() {
 		args = append(args,
-			config.NewFlag("public-addr", controller.ContainerEnvVarReference(podIPEnvVar)))
+			cephconfig.NewFlag("public-addr", controller.ContainerEnvVarReference(podIPEnvVar)))
 	}
 
 	container := v1.Container{
@@ -146,30 +147,30 @@ func (c *Cluster) makeMdsDaemonContainer(mdsConfig *mdsConfig) v1.Container {
 		Env:             append(controller.DaemonEnvVars(c.clusterSpec.CephVersion.Image), k8sutil.PodIPEnvVar(podIPEnvVar)),
 		Resources:       c.fs.Spec.MetadataServer.Resources,
 		SecurityContext: controller.PodSecurityContext(),
-		LivenessProbe:   controller.GenerateLivenessProbeExecDaemon(config.MdsType, mdsConfig.DaemonID),
-		WorkingDir:      config.VarLogCephDir,
+		StartupProbe:    controller.GenerateStartupProbeExecDaemon(cephconfig.MdsType, mdsConfig.DaemonID),
+		LivenessProbe:   controller.GenerateLivenessProbeExecDaemon(cephconfig.MdsType, mdsConfig.DaemonID),
+		WorkingDir:      cephconfig.VarLogCephDir,
 	}
 
 	return container
 }
 
 func (c *Cluster) podLabels(mdsConfig *mdsConfig, includeNewLabels bool) map[string]string {
-	labels := controller.CephDaemonAppLabels(AppName, c.fs.Namespace, "mds", mdsConfig.DaemonID, includeNewLabels)
+	labels := controller.CephDaemonAppLabels(AppName, c.fs.Namespace, cephconfig.MdsType, mdsConfig.DaemonID, c.fs.Name, "cephfilesystems.ceph.rook.io", includeNewLabels)
 	labels["rook_file_system"] = c.fs.Name
 	return labels
 }
 
-func getMdsDeployments(context *clusterd.Context, namespace, fsName string) (*apps.DeploymentList, error) {
+func getMdsDeployments(ctx context.Context, context *clusterd.Context, namespace, fsName string) (*apps.DeploymentList, error) {
 	fsLabelSelector := fmt.Sprintf("rook_file_system=%s", fsName)
-	deps, err := k8sutil.GetDeployments(context.Clientset, namespace, fsLabelSelector)
+	deps, err := k8sutil.GetDeployments(ctx, context.Clientset, namespace, fsLabelSelector)
 	if err != nil {
 		return nil, errors.Wrapf(err, "could not get deployments for filesystem %s (matching label selector %q)", fsName, fsLabelSelector)
 	}
 	return deps, nil
 }
 
-func deleteMdsDeployment(clusterdContext *clusterd.Context, namespace string, deployment *apps.Deployment) error {
-	ctx := context.TODO()
+func deleteMdsDeployment(ctx context.Context, clusterdContext *clusterd.Context, namespace string, deployment *apps.Deployment) error {
 	// Delete the mds deployment
 	logger.Infof("deleting mds deployment %s", deployment.Name)
 	var gracePeriod int64
@@ -181,8 +182,7 @@ func deleteMdsDeployment(clusterdContext *clusterd.Context, namespace string, de
 	return nil
 }
 
-func scaleMdsDeployment(clusterdContext *clusterd.Context, namespace string, deployment *apps.Deployment, replicas int32) error {
-	ctx := context.TODO()
+func scaleMdsDeployment(ctx context.Context, clusterdContext *clusterd.Context, namespace string, deployment *apps.Deployment, replicas int32) error {
 	// scale mds deployment
 	logger.Infof("scaling mds deployment %q to %d replicas", deployment.Name, replicas)
 	d, err := clusterdContext.Clientset.AppsV1().Deployments(namespace).Get(ctx, deployment.GetName(), metav1.GetOptions{})

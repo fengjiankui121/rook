@@ -28,7 +28,7 @@ import (
 	rookclient "github.com/rook/rook/pkg/client/clientset/versioned/fake"
 	"github.com/rook/rook/pkg/clusterd"
 	cephclient "github.com/rook/rook/pkg/daemon/ceph/client"
-	opconfig "github.com/rook/rook/pkg/operator/ceph/config"
+	"github.com/rook/rook/pkg/operator/ceph/config"
 	"github.com/rook/rook/pkg/operator/ceph/version"
 	"github.com/rook/rook/pkg/operator/k8sutil"
 	"github.com/rook/rook/pkg/operator/test"
@@ -40,7 +40,7 @@ import (
 )
 
 func TestPodVolumes(t *testing.T) {
-	dataPathMap := opconfig.NewDatalessDaemonDataPathMap("rook-ceph", "/var/lib/rook")
+	dataPathMap := config.NewDatalessDaemonDataPathMap("rook-ceph", "/var/lib/rook")
 
 	if err := test.VolumeIsEmptyDir(k8sutil.DataDirVolume, PodVolumes(dataPathMap, "", false)); err != nil {
 		t.Errorf("PodVolumes(\"\") - data dir source is not EmptyDir: %s", err.Error())
@@ -52,7 +52,7 @@ func TestPodVolumes(t *testing.T) {
 
 func TestMountsMatchVolumes(t *testing.T) {
 
-	dataPathMap := opconfig.NewDatalessDaemonDataPathMap("rook-ceph", "/var/lib/rook")
+	dataPathMap := config.NewDatalessDaemonDataPathMap("rook-ceph", "/var/lib/rook")
 
 	volsMountsTestDef := test.VolumesAndMountsTestDefinition{
 		VolumesSpec: &test.VolumesSpec{
@@ -115,24 +115,24 @@ func TestCheckPodMemory(t *testing.T) {
 }
 
 func TestBuildAdminSocketCommand(t *testing.T) {
-	c := getDaemonConfig(opconfig.OsdType, "")
+	c := getDaemonConfig(config.OsdType, "")
 
 	command := c.buildAdminSocketCommand()
 	assert.Equal(t, "status", command)
 
-	c.daemonType = opconfig.MonType
+	c.daemonType = config.MonType
 	command = c.buildAdminSocketCommand()
 	assert.Equal(t, "mon_status", command)
 }
 
 func TestBuildSocketName(t *testing.T) {
 	daemonID := "0"
-	c := getDaemonConfig(opconfig.OsdType, daemonID)
+	c := getDaemonConfig(config.OsdType, daemonID)
 
 	socketName := c.buildSocketName()
 	assert.Equal(t, "ceph-osd.0.asok", socketName)
 
-	c.daemonType = opconfig.MonType
+	c.daemonType = config.MonType
 	c.daemonID = "a"
 	socketName = c.buildSocketName()
 	assert.Equal(t, "ceph-mon.a.asok", socketName)
@@ -140,7 +140,7 @@ func TestBuildSocketName(t *testing.T) {
 
 func TestBuildSocketPath(t *testing.T) {
 	daemonID := "0"
-	c := getDaemonConfig(opconfig.OsdType, daemonID)
+	c := getDaemonConfig(config.OsdType, daemonID)
 
 	socketPath := c.buildSocketPath()
 	assert.Equal(t, "/run/ceph/ceph-osd.0.asok", socketPath)
@@ -148,7 +148,7 @@ func TestBuildSocketPath(t *testing.T) {
 
 func TestGenerateLivenessProbeExecDaemon(t *testing.T) {
 	daemonID := "0"
-	probe := GenerateLivenessProbeExecDaemon(opconfig.OsdType, daemonID)
+	probe := GenerateLivenessProbeExecDaemon(config.OsdType, daemonID)
 	expectedCommand := []string{"env",
 		"-i",
 		"sh",
@@ -156,13 +156,12 @@ func TestGenerateLivenessProbeExecDaemon(t *testing.T) {
 		"ceph --admin-daemon /run/ceph/ceph-osd.0.asok status",
 	}
 
-	assert.Equal(t, expectedCommand, probe.Handler.Exec.Command)
-	// it's an OSD the delay must be 45
-	assert.Equal(t, initialDelaySecondsOSDDaemon, probe.InitialDelaySeconds)
+	assert.Equal(t, expectedCommand, probe.ProbeHandler.Exec.Command)
+	assert.Equal(t, livenessProbeInitialDelaySeconds, probe.InitialDelaySeconds)
 
 	// test with a mon so the delay should be 10
-	probe = GenerateLivenessProbeExecDaemon(opconfig.MonType, "a")
-	assert.Equal(t, initialDelaySecondsNonOSDDaemon, probe.InitialDelaySeconds)
+	probe = GenerateLivenessProbeExecDaemon(config.MonType, "a")
+	assert.Equal(t, livenessProbeInitialDelaySeconds, probe.InitialDelaySeconds)
 }
 
 func TestDaemonFlags(t *testing.T) {
@@ -248,18 +247,14 @@ func TestExtractMgrIP(t *testing.T) {
 }
 
 func TestConfigureExternalMetricsEndpoint(t *testing.T) {
+	clusterInfo := cephclient.AdminTestClusterInfo("rook-ceph")
 	t.Run("spec and current active mgr endpoint identical with no existing endpoint object", func(t *testing.T) {
 		monitoringSpec := cephv1.MonitoringSpec{
 			Enabled:              true,
-			RulesNamespace:       "rook-ceph",
 			ExternalMgrEndpoints: []v1.EndpointAddress{{IP: "192.168.0.1"}},
 		}
-		clusterInfo := &cephclient.ClusterInfo{
-			FSID:      "id",
-			Namespace: "rook-ceph",
-		}
 		executor := &exectest.MockExecutor{
-			MockExecuteCommandWithOutputFile: func(command, outFile string, args ...string) (string, error) {
+			MockExecuteCommandWithOutput: func(command string, args ...string) (string, error) {
 				logger.Infof("Command: %s %v", command, args)
 				if args[1] == "dump" {
 					return fmt.Sprintf(`{"active_addr":"%s"}`, "192.168.0.1:6801/2535462469"), nil
@@ -267,6 +262,7 @@ func TestConfigureExternalMetricsEndpoint(t *testing.T) {
 				return "", errors.New("unknown command")
 			},
 		}
+
 		ctx := &clusterd.Context{
 			Clientset:     test.New(t, 3),
 			RookClientset: rookclient.NewSimpleClientset(),
@@ -284,15 +280,10 @@ func TestConfigureExternalMetricsEndpoint(t *testing.T) {
 	t.Run("spec and current active mgr endpoint different with no existing endpoint object", func(t *testing.T) {
 		monitoringSpec := cephv1.MonitoringSpec{
 			Enabled:              true,
-			RulesNamespace:       "rook-ceph",
 			ExternalMgrEndpoints: []v1.EndpointAddress{{IP: "192.168.0.1"}},
 		}
-		clusterInfo := &cephclient.ClusterInfo{
-			FSID:      "id",
-			Namespace: "rook-ceph",
-		}
 		executor := &exectest.MockExecutor{
-			MockExecuteCommandWithOutputFile: func(command, outFile string, args ...string) (string, error) {
+			MockExecuteCommandWithOutput: func(command string, args ...string) (string, error) {
 				logger.Infof("Command: %s %v", command, args)
 				if args[1] == "dump" {
 					return fmt.Sprintf(`{"active_addr":"%s"}`, "172.17.0.12:6801/2535462469"), nil
@@ -317,15 +308,10 @@ func TestConfigureExternalMetricsEndpoint(t *testing.T) {
 	t.Run("spec and current active mgr endpoint different with existing endpoint object", func(t *testing.T) {
 		monitoringSpec := cephv1.MonitoringSpec{
 			Enabled:              true,
-			RulesNamespace:       "rook-ceph",
 			ExternalMgrEndpoints: []v1.EndpointAddress{{IP: "192.168.0.1"}},
 		}
-		clusterInfo := &cephclient.ClusterInfo{
-			FSID:      "id",
-			Namespace: "rook-ceph",
-		}
 		executor := &exectest.MockExecutor{
-			MockExecuteCommandWithOutputFile: func(command, outFile string, args ...string) (string, error) {
+			MockExecuteCommandWithOutput: func(command string, args ...string) (string, error) {
 				logger.Infof("Command: %s %v", command, args)
 				if args[1] == "dump" {
 					return fmt.Sprintf(`{"active_addr":"%s"}`, "172.17.0.12:6801/2535462469"), nil
@@ -355,15 +341,10 @@ func TestConfigureExternalMetricsEndpoint(t *testing.T) {
 	t.Run("spec and current active mgr endpoint identical with existing endpoint object", func(t *testing.T) {
 		monitoringSpec := cephv1.MonitoringSpec{
 			Enabled:              true,
-			RulesNamespace:       "rook-ceph",
 			ExternalMgrEndpoints: []v1.EndpointAddress{{IP: "192.168.0.1"}},
 		}
-		clusterInfo := &cephclient.ClusterInfo{
-			FSID:      "id",
-			Namespace: "rook-ceph",
-		}
 		executor := &exectest.MockExecutor{
-			MockExecuteCommandWithOutputFile: func(command, outFile string, args ...string) (string, error) {
+			MockExecuteCommandWithOutput: func(command string, args ...string) (string, error) {
 				logger.Infof("Command: %s %v", command, args)
 				if args[1] == "dump" {
 					return fmt.Sprintf(`{"active_addr":"%s"}`, "192.168.0.1:6801/2535462469"), nil

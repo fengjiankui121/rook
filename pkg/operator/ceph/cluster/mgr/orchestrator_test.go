@@ -16,6 +16,7 @@ limitations under the License.
 package mgr
 
 import (
+	"context"
 	"testing"
 	"time"
 
@@ -23,17 +24,18 @@ import (
 	"github.com/rook/rook/pkg/clusterd"
 	cephclient "github.com/rook/rook/pkg/daemon/ceph/client"
 	cephver "github.com/rook/rook/pkg/operator/ceph/version"
+	"github.com/rook/rook/pkg/util/exec"
 	exectest "github.com/rook/rook/pkg/util/exec/test"
 	"github.com/stretchr/testify/assert"
 )
 
 func TestOrchestratorModules(t *testing.T) {
 	executor := &exectest.MockExecutor{}
-	context := &clusterd.Context{Executor: executor}
 	rookModuleEnabled := false
 	rookBackendSet := false
 	backendErrorCount := 0
-	executor.MockExecuteCommandWithOutputFile = func(command, outputFile string, args ...string) (string, error) {
+	exec.CephCommandsTimeout = 15 * time.Second
+	executor.MockExecuteCommandWithOutput = func(command string, args ...string) (string, error) {
 		logger.Infof("Command: %s %v", command, args)
 		if args[0] == "mgr" && args[1] == "module" && args[2] == "enable" {
 			if args[3] == "rook" {
@@ -43,9 +45,9 @@ func TestOrchestratorModules(t *testing.T) {
 		}
 		return "", errors.Errorf("unexpected ceph command '%v'", args)
 	}
-	executor.MockExecuteCommandWithOutputFileTimeout = func(timeout time.Duration, command, outputFile string, args ...string) (string, error) {
+	executor.MockExecuteCommandWithTimeout = func(timeout time.Duration, command string, args ...string) (string, error) {
 		logger.Infof("Command: %s %v", command, args)
-		if args[0] == "orchestrator" && args[1] == "set" && args[2] == "backend" && args[3] == "rook" {
+		if args[0] == "orch" && args[1] == "set" && args[2] == "backend" && args[3] == "rook" {
 			if backendErrorCount < 5 {
 				backendErrorCount++
 				return "", errors.New("test simulation failure")
@@ -57,8 +59,10 @@ func TestOrchestratorModules(t *testing.T) {
 	}
 
 	clusterInfo := &cephclient.ClusterInfo{
-		CephVersion: cephver.Nautilus,
+		CephVersion: cephver.Octopus,
+		Context:     context.TODO(),
 	}
+	context := &clusterd.Context{Executor: executor}
 
 	c := &Cluster{clusterInfo: clusterInfo, context: context}
 	c.exitCode = func(err error) (int, bool) {
@@ -82,11 +86,11 @@ func TestOrchestratorModules(t *testing.T) {
 	assert.True(t, rookModuleEnabled)
 	assert.True(t, rookBackendSet)
 
-	// Simulate the error because of the CLI name change
-	c.clusterInfo.CephVersion = cephver.Octopus
+	c.clusterInfo.CephVersion = cephver.Pacific
 	err = c.setRookOrchestratorBackend()
-	assert.Error(t, err)
-	executor.MockExecuteCommandWithOutputFileTimeout = func(timeout time.Duration, command, outputFile string, args ...string) (string, error) {
+	// No error because there is no CLI change(in Nautilus arg[0] was "orchestrator" but since Octopus it is "orch")
+	assert.NoError(t, err)
+	executor.MockExecuteCommandWithTimeout = func(timeout time.Duration, command string, args ...string) (string, error) {
 		logger.Infof("Command: %s %v", command, args)
 		if args[0] == "orch" && args[1] == "set" && args[2] == "backend" && args[3] == "rook" {
 			if backendErrorCount < 5 {

@@ -17,9 +17,12 @@ limitations under the License.
 package client
 
 import (
+	"encoding/json"
 	"fmt"
 
+	"github.com/pkg/errors"
 	cephv1 "github.com/rook/rook/pkg/apis/ceph.rook.io/v1"
+	"github.com/rook/rook/pkg/clusterd"
 )
 
 const (
@@ -35,6 +38,20 @@ rule %s {
         step take %s %s
         step choose firstn 0 type %s
         step chooseleaf firstn 2 type %s
+        step emit
+}
+`
+	twoStepHybridCRUSHRuleTemplate = `
+rule %s {
+        id %d
+        type replicated
+        min_size %d
+        max_size %d
+        step take %s class %s
+        step chooseleaf firstn 1 type %s
+        step emit
+        step take %s class %s
+        step chooseleaf firstn 0 type %s
         step emit
 }
 `
@@ -59,6 +76,25 @@ func buildTwoStepPlainCrushRule(crushMap CrushMap, ruleName string, pool cephv1.
 		crushRuleInsert,
 		pool.FailureDomain,
 		pool.Replicated.SubFailureDomain,
+	)
+}
+
+func buildTwoStepHybridCrushRule(crushMap CrushMap, ruleName string, pool cephv1.PoolSpec) string {
+	primaryOSDDeviceClass := pool.Replicated.HybridStorage.PrimaryDeviceClass
+	secondaryOSDsDeviceClass := pool.Replicated.HybridStorage.SecondaryDeviceClass
+
+	return fmt.Sprintf(
+		twoStepHybridCRUSHRuleTemplate,
+		ruleName,
+		generateRuleID(crushMap.Rules),
+		ruleMinSizeDefault,
+		ruleMaxSizeDefault,
+		pool.CrushRoot,
+		primaryOSDDeviceClass,
+		pool.FailureDomain,
+		pool.CrushRoot,
+		secondaryOSDsDeviceClass,
+		pool.FailureDomain,
 	)
 }
 
@@ -146,4 +182,20 @@ func checkIfRuleIDExists(rules []ruleSpec, ID int) bool {
 	}
 
 	return false
+}
+
+func getCrushRule(context *clusterd.Context, clusterInfo *ClusterInfo, name string) (ruleSpec, error) {
+	var rule ruleSpec
+	args := []string{"osd", "crush", "rule", "dump", name}
+	buf, err := NewCephCommand(context, clusterInfo, args).Run()
+	if err != nil {
+		return rule, errors.Wrapf(err, "failed to get crush rule %q. %s", name, string(buf))
+	}
+
+	err = json.Unmarshal(buf, &rule)
+	if err != nil {
+		return rule, errors.Wrapf(err, "failed to unmarshal crush rule. %s", string(buf))
+	}
+
+	return rule, nil
 }

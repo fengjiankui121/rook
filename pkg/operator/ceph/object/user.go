@@ -37,13 +37,16 @@ const (
 
 // An ObjectUser defines the details of an object store user.
 type ObjectUser struct {
-	UserID       string  `json:"userId"`
-	DisplayName  *string `json:"displayName"`
-	Email        *string `json:"email"`
-	AccessKey    *string `json:"accessKey"`
-	SecretKey    *string `json:"secretKey"`
-	SystemUser   bool    `json:"systemuser"`
-	AdminOpsUser bool    `json:"adminopsuser"`
+	UserID       string              `json:"userId"`
+	DisplayName  *string             `json:"displayName"`
+	Email        *string             `json:"email"`
+	AccessKey    *string             `json:"accessKey"`
+	SecretKey    *string             `json:"secretKey"`
+	SystemUser   bool                `json:"systemuser"`
+	AdminOpsUser bool                `json:"adminopsuser"`
+	MaxBuckets   int                 `json:"max_buckets"`
+	UserQuota    admin.QuotaSpec     `json:"user_quota"`
+	Caps         []admin.UserCapSpec `json:"caps"`
 }
 
 // func decodeUser(data string) (*ObjectUser, int, error) {
@@ -55,6 +58,18 @@ func decodeUser(data string) (*ObjectUser, int, error) {
 	}
 
 	rookUser := ObjectUser{UserID: user.ID, DisplayName: &user.DisplayName, Email: &user.Email}
+
+	if len(user.Caps) > 0 {
+		rookUser.Caps = user.Caps
+	}
+
+	if user.MaxBuckets != nil {
+		rookUser.MaxBuckets = *user.MaxBuckets
+	}
+
+	if user.UserQuota.Enabled != nil {
+		rookUser.UserQuota = user.UserQuota
+	}
 
 	if len(user.Keys) > 0 {
 		rookUser.AccessKey = &user.Keys[0].AccessKey
@@ -89,7 +104,7 @@ func GetUser(c *Context, id string) (*ObjectUser, int, error) {
 // CreateUser creates a new user with the information given.
 // The function is used **ONCE** only to provision so the RGW Admin Ops User
 // Subsequent interaction with the API will be done with the created user
-func CreateUser(c *Context, user ObjectUser) (*ObjectUser, int, error) {
+func CreateUser(c *Context, user ObjectUser, force bool) (*ObjectUser, int, error) {
 	logger.Debugf("creating s3 user %q", user.UserID)
 
 	if strings.TrimSpace(user.UserID) == "" {
@@ -119,8 +134,24 @@ func CreateUser(c *Context, user ObjectUser) (*ObjectUser, int, error) {
 		args = append(args, "--caps", rgwAdminOpsUserCaps)
 	}
 
+	if user.AccessKey != nil {
+		args = append(args, "--access-key", *user.AccessKey)
+	}
+
+	if user.SecretKey != nil {
+		args = append(args, "--secret", *user.SecretKey)
+	}
+
+	if force {
+		args = append(args, "--yes-i-really-mean-it")
+	}
+
 	result, err := runAdminCommand(c, true, args...)
 	if err != nil {
+		if code, err := exec.ExtractExitCode(err); err == nil && code == int(syscall.EEXIST) {
+			return nil, ErrorCodeFileExists, errors.New("s3 user already exists")
+		}
+
 		if strings.Contains(result, "could not create user: unable to create user, user: ") {
 			return nil, ErrorCodeFileExists, errors.New("s3 user already exists")
 		}
@@ -137,6 +168,27 @@ func CreateUser(c *Context, user ObjectUser) (*ObjectUser, int, error) {
 		return nil, RGWErrorUnknown, errors.Wrapf(err, "failed to create s3 user. %s", result)
 	}
 	return decodeUser(result)
+}
+
+// CreateOrRecreateUserIfExists if the user doesn't exist, it is created, should it already exist it is deleted and re-created
+// It is called from the rgw dashboard setup logic.
+func CreateOrRecreateUserIfExists(c *Context, user ObjectUser, force bool) (*ObjectUser, int, error) {
+	objUser, errCode, err := CreateUser(c, user, force)
+	if err != nil || (errCode != ErrorCodeFileExists && errCode != RGWErrorNone) {
+		return nil, errCode, err
+	}
+
+	if errCode == RGWErrorNone {
+		return objUser, errCode, err
+	} else if errCode == ErrorCodeFileExists {
+		// If the user already exists, delete and re-create it
+		_, err := DeleteUser(c, user.UserID)
+		if err != nil {
+			return nil, RGWErrorUnknown, err
+		}
+	}
+
+	return CreateUser(c, user, force)
 }
 
 func ListUserBuckets(c *Context, id string, opts ...string) (string, error) {

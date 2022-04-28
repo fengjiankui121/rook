@@ -18,24 +18,35 @@ include ../image.mk
 # Image Build Options
 
 ifeq ($(GOARCH),amd64)
-CEPH_VERSION = v16.2.4-20210513
+CEPH_VERSION = v16.2.7-20220216
 else
-CEPH_VERSION = v16.2.4-20210514
+CEPH_VERSION = v16.2.7-20220216
 endif
-BASEIMAGE = ceph/ceph-$(GOARCH):$(CEPH_VERSION)
+REGISTRY_NAME = quay.io
+BASEIMAGE = $(REGISTRY_NAME)/ceph/ceph-$(GOARCH):$(CEPH_VERSION)
 CEPH_IMAGE = $(BUILD_REGISTRY)/ceph-$(GOARCH)
 OPERATOR_SDK_VERSION = v0.17.1
 # TODO: update to yq v4 - v3 end of life in Aug 2021 ; v4 removes the 'yq delete' cmd and changes syntax
-YQ_VERSION = 3.3.0
+YQv3_VERSION = 3.3.0
 GOHOST := GOOS=$(GOHOSTOS) GOARCH=$(GOHOSTARCH) go
+MANIFESTS_DIR=../../deploy/examples
 
 TEMP := $(shell mktemp -d)
 
-ifeq ($(HOST_PLATFORM),linux_amd64)
+# Note: as of version 1.3 of operator-sdk, the url format changed to:
+# ${OPERATOR_SDK_DL_URL}/operator-sdk_${OS}_${ARCH}
+# (see: https://sdk.operatorframework.io/docs/installation/)
+S5CMD_ARCH = Linux-64bit
+ifeq ($(REAL_HOST_PLATFORM),linux_amd64)
 OPERATOR_SDK_PLATFORM = x86_64-linux-gnu
 INCLUDE_CSV_TEMPLATES = true
 endif
-ifeq ($(HOST_PLATFORM),darwin_amd64)
+ifeq ($(REAL_HOST_PLATFORM),linux_arm64)
+OPERATOR_SDK_PLATFORM = aarch64-linux-gnu
+INCLUDE_CSV_TEMPLATES = true
+S5CMD_ARCH = Linux-arm64
+endif
+ifeq ($(REAL_HOST_PLATFORM),darwin_amd64)
 OPERATOR_SDK_PLATFORM = x86_64-apple-darwin
 INCLUDE_CSV_TEMPLATES = true
 endif
@@ -45,76 +56,99 @@ $(info NOT INCLUDING OLM/CSV TEMPLATES!)
 $(info )
 endif
 
+# s5cmd's version
+S5CMD_VERSION = 1.4.0
+
 OPERATOR_SDK := $(TOOLS_HOST_DIR)/operator-sdk-$(OPERATOR_SDK_VERSION)
-YQ := $(TOOLS_HOST_DIR)/yq-$(YQ_VERSION)
-export OPERATOR_SDK YQ
+YQv3 := $(TOOLS_HOST_DIR)/yq-$(YQv3_VERSION)
+export OPERATOR_SDK YQv3
 
 # ====================================================================================
 # Build Rook
 
-do.build: generate-csv-ceph-templates
+do.build:
 	@echo === container build $(CEPH_IMAGE)
 	@cp Dockerfile $(TEMP)
 	@cp toolbox.sh $(TEMP)
 	@cp set-ceph-debug-level $(TEMP)
 	@cp $(OUTPUT_DIR)/bin/linux_$(GOARCH)/rook $(TEMP)
-	@cp $(OUTPUT_DIR)/bin/linux_$(GOARCH)/rookflex $(TEMP)
-	@cp -r ../../cluster/examples/kubernetes/ceph/csi/template $(TEMP)/ceph-csi
-	@cp -r ../../cluster/examples/kubernetes/ceph/monitoring $(TEMP)/ceph-monitoring
+	@cp -r $(MANIFESTS_DIR)/monitoring $(TEMP)/ceph-monitoring
 	@mkdir -p $(TEMP)/rook-external/test-data
-	@cp ../../cluster/examples/kubernetes/ceph/create-external-cluster-resources.* $(TEMP)/rook-external/
-	@cp ../../cluster/examples/kubernetes/ceph/test-data/ceph-status-out $(TEMP)/rook-external/test-data/
-	@if [ ! "$(INCLUDE_CSV_TEMPLATES)" = "" ]; then\
-		cp -r ../../cluster/olm/ceph/templates $(TEMP)/ceph-csv-templates;\
-	else\
-		mkdir $(TEMP)/ceph-csv-templates;\
-	fi
-	@cd $(TEMP) && $(SED_CMD) 's|BASEIMAGE|$(BASEIMAGE)|g' Dockerfile
+	@cp $(MANIFESTS_DIR)/create-external-cluster-resources.* $(TEMP)/rook-external/
+	@cp ../../tests/ceph-status-out $(TEMP)/rook-external/test-data/
+
+ifeq ($(INCLUDE_CSV_TEMPLATES),true)
+	@$(MAKE) CSV_TEMPLATE_DIR=$(TEMP) generate-csv-templates
+	@cp -r $(TEMP)/deploy/olm/templates $(TEMP)/ceph-csv-templates
+else
+	mkdir $(TEMP)/ceph-csv-templates
+endif
+	@cd $(TEMP) && $(SED_IN_PLACE) 's|BASEIMAGE|$(BASEIMAGE)|g' Dockerfile
 	@if [ -z "$(BUILD_CONTAINER_IMAGE)" ]; then\
 		$(DOCKERCMD) build $(BUILD_ARGS) \
-		--build-arg ARCH=$(GOARCH) \
-		--build-arg TINI_VERSION=$(TINI_VERSION) \
+		--build-arg S5CMD_VERSION=$(S5CMD_VERSION) \
+		--build-arg S5CMD_ARCH=$(S5CMD_ARCH) \
 		-t $(CEPH_IMAGE) \
 		$(TEMP);\
 	fi
 	@rm -fr $(TEMP)
-	@$(MAKE) -C ../.. crds # revert changes made to the crds.yaml file during the csv-gen sequence
 
-generate-csv-ceph-templates: $(OPERATOR_SDK) $(YQ)
-	@if [ ! "$(INCLUDE_CSV_TEMPLATES)" = "" ]; then\
-		if [ "$(GOARCH)" = amd64 ]; then\
-			BEFORE_GEN_CRD_SIZE=$$(wc -l < ../../cluster/examples/kubernetes/ceph/crds.yaml);\
-			$(MAKE) -C ../.. NO_OB_OBC_VOL_GEN=true MAX_DESC_LEN=0 crds;\
-			AFTER_GEN_CRD_SIZE=$$(wc -l < ../../cluster/examples/kubernetes/ceph/crds.yaml);\
-			if [ "$$BEFORE_GEN_CRD_SIZE" -le "$$AFTER_GEN_CRD_SIZE" ]; then\
-				echo "the new crd file must be smaller since the description fields were stripped!";\
-				echo "length before $$BEFORE_GEN_CRD_SIZE";\
-				echo "length after $$AFTER_GEN_CRD_SIZE";\
-				exit 1;\
-			fi;\
-		fi;\
-		../../cluster/olm/ceph/generate-rook-csv-templates.sh;\
-	fi
+# call this before building multiple arches in parallel to prevent parallel build processes from
+# conflicting
+prerequisites: $(OPERATOR_SDK) $(YQv3)
 
-$(YQ):
-	@if [ ! "$(INCLUDE_CSV_TEMPLATES)" = "" ]; then\
-		echo === installing yq $(GOHOST);\
-		mkdir -p $(TOOLS_HOST_DIR);\
-		curl -JL https://github.com/mikefarah/yq/releases/download/$(YQ_VERSION)/yq_$(HOST_PLATFORM) -o $(YQ);\
-		chmod +x $(YQ);\
+# generate CSV template files into the directory defined by the env var CSV_TEMPLATE_DIR
+# CSV_TEMPLATE_DIR will be created if it doesn't already exist
+generate-csv-templates: $(OPERATOR_SDK) $(YQv3) ## Generate CSV templates for OLM into CSV_TEMPLATE_DIR
+	@if [[ -z "$(CSV_TEMPLATE_DIR)" ]]; then echo "CSV_TEMPLATE_DIR is not set"; exit 1; fi
+	@# first, copy the existing CRDs and OLM catalog directory to CSV_TEMPLATE_DIR
+	@# then, generate or copy all prerequisites into CSV_TEMPLATE_DIR (e.g., CRDs)
+	@# finally, generate the templates in-place using CSV_TEMPLATE_DIR as a staging dir
+	@mkdir -p $(CSV_TEMPLATE_DIR)
+	@cp -a ../../deploy $(CSV_TEMPLATE_DIR)/deploy
+	@set -eE;\
+	BEFORE_GEN_CRD_SIZE=$$(wc -l < $(MANIFESTS_DIR)/crds.yaml);\
+	$(MAKE) -C ../.. NO_OB_OBC_VOL_GEN=true MAX_DESC_LEN=0 BUILD_CRDS_INTO_DIR=$(CSV_TEMPLATE_DIR) crds;\
+	AFTER_GEN_CRD_SIZE=$$(wc -l < $(CSV_TEMPLATE_DIR)/deploy/examples/crds.yaml);\
+	if [ "$$BEFORE_GEN_CRD_SIZE" -le "$$AFTER_GEN_CRD_SIZE" ]; then\
+		echo "the new crd file must be smaller since the description fields were stripped!";\
+		echo "length before $$BEFORE_GEN_CRD_SIZE";\
+		echo "length after $$AFTER_GEN_CRD_SIZE";\
+		exit 1;\
 	fi
+	@OLM_CATALOG_DIR=$(CSV_TEMPLATE_DIR)/deploy/olm ../../deploy/olm/generate-rook-csv-templates.sh
+	@echo " === Generated CSV templates can be found at $(CSV_TEMPLATE_DIR)/deploy/olm/templates"
+
+$(YQv3):
+	@echo === installing yq $(YQv3_VERSION) $(REAL_HOST_PLATFORM)
+	@mkdir -p $(TOOLS_HOST_DIR)
+	@curl -JL https://github.com/mikefarah/yq/releases/download/$(YQv3_VERSION)/yq_$(REAL_HOST_PLATFORM) -o $(YQv3)
+	@chmod +x $(YQv3)
 
 $(OPERATOR_SDK):
-	@if [ ! "$(INCLUDE_CSV_TEMPLATES)" = "" ]; then\
-		echo === installing operator-sdk $(GOHOST);\
-		mkdir -p $(TOOLS_HOST_DIR);\
-		curl -JL https://github.com/operator-framework/operator-sdk/releases/download/$(OPERATOR_SDK_VERSION)/operator-sdk-$(OPERATOR_SDK_VERSION)-$(OPERATOR_SDK_PLATFORM) -o $(TOOLS_HOST_DIR)/operator-sdk-$(OPERATOR_SDK_VERSION);\
-		chmod +x $(OPERATOR_SDK);\
-	fi
+	@echo === installing operator-sdk $(REAL_HOST_PLATFORM)
+	@mkdir -p $(TOOLS_HOST_DIR)
+	@curl -JL -o $(TOOLS_HOST_DIR)/operator-sdk-$(OPERATOR_SDK_VERSION) \
+		https://github.com/operator-framework/operator-sdk/releases/download/$(OPERATOR_SDK_VERSION)/operator-sdk-$(OPERATOR_SDK_VERSION)-$(OPERATOR_SDK_PLATFORM)
+	@chmod +x $(OPERATOR_SDK)
+	@$(OPERATOR_SDK) version
 
-csv: $(OPERATOR_SDK) $(YQ) ## Generate a CSV file for OLM.
+csv: $(OPERATOR_SDK) $(YQv3) $(HELM) ## Generate a CSV file for OLM.
 	@echo Generating CSV manifests
-	@cd ../.. && cluster/olm/ceph/generate-rook-csv.sh $(CSV_VERSION) $(CSV_PLATFORM) $(ROOK_OP_VERSION)
+	@cd ../.. && deploy/olm/generate-rook-csv.sh $(CSV_VERSION) $(CSV_PLATFORM) $(ROOK_OP_VERSION)
 
-csv-clean: $(OPERATOR_SDK) $(YQ) ## Remove existing OLM files.
-	@rm -fr ../../cluster/olm/ceph/deploy/* ../../cluster/olm/ceph/templates/*
+csv-clean: ## Remove existing OLM files.
+	@rm -fr ../../deploy/olm/deploy/* ../../deploy/olm/templates/*
+
+# reading from a file and outputting to the same file can have undefined results, so use this intermediate
+IMAGE_TMP="/tmp/rook-ceph-image-list"
+list-image: ## Create a list of images for offline installation
+	@echo "producing list of images for offline installation"
+	rm -f $(IMAGE_TMP)
+	awk '/image:/ {print $2}' $(MANIFESTS_DIR)/operator.yaml $(MANIFESTS_DIR)/cluster.yaml | \
+		cut -d: -f2- | tee $(IMAGE_TMP)
+	awk '/quay.io/ || /k8s.gcr.io/ {print $3}' ../../pkg/operator/ceph/csi/spec.go | \
+		cut -d= -f2- | tr -d '"' | tee -a $(IMAGE_TMP)
+	rm -f $(MANIFESTS_DIR)/images.txt
+	cat $(IMAGE_TMP) | sort -h | uniq | tee $(MANIFESTS_DIR)/images.txt
+	rm -f $(IMAGE_TMP)

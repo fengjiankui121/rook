@@ -32,6 +32,8 @@ import (
 
 	"github.com/pkg/errors"
 	cephv1 "github.com/rook/rook/pkg/apis/ceph.rook.io/v1"
+	"github.com/rook/rook/pkg/operator/k8sutil"
+	policyv1 "k8s.io/api/policy/v1"
 	policyv1beta1 "k8s.io/api/policy/v1beta1"
 	"k8s.io/apimachinery/pkg/types"
 )
@@ -40,19 +42,12 @@ import (
 // Read more about how Managers, Controllers, and their Watches, Handlers, Predicates, etc work here:
 // https://godoc.org/github.com/kubernetes-sigs/controller-runtime/pkg
 func Add(mgr manager.Manager, context *controllerconfig.Context) error {
-
-	// Add the cephv1 scheme to the manager scheme
-	mgrScheme := mgr.GetScheme()
-	if err := cephv1.AddToScheme(mgr.GetScheme()); err != nil {
-		return errors.Wrap(err, "failed to add ceph scheme to manager scheme")
-	}
-
 	// This will be used to associate namespaces and cephclusters.
 	sharedClusterMap := &ClusterMap{}
 
 	reconcileClusterDisruption := &ReconcileClusterDisruption{
 		client:     mgr.GetClient(),
-		scheme:     mgrScheme,
+		scheme:     mgr.GetScheme(),
 		context:    context,
 		clusterMap: sharedClusterMap,
 	}
@@ -65,7 +60,7 @@ func Add(mgr manager.Manager, context *controllerconfig.Context) error {
 
 	cephClusterPredicate := predicate.Funcs{
 		CreateFunc: func(e event.CreateEvent) bool {
-			logger.Info("create event from ceph cluster CR")
+			logger.Debug("create event from ceph cluster CR")
 			return true
 		},
 		UpdateFunc: func(e event.UpdateEvent) bool {
@@ -87,6 +82,11 @@ func Add(mgr manager.Manager, context *controllerconfig.Context) error {
 		return err
 	}
 
+	usePDBV1Beta1, err := k8sutil.UsePDBV1Beta1Version(reconcileClusterDisruption.context.ClusterdContext.Clientset)
+	if err != nil {
+		return errors.Wrap(err, "failed to fetch pdb version")
+	}
+
 	// Only reconcile for PDB update event when allowed disruptions for the main OSD PDB is 0.
 	// This means that one of the OSD is down due to node drain or any other reason
 	pdbPredicate := predicate.Funcs{
@@ -95,7 +95,14 @@ func Add(mgr manager.Manager, context *controllerconfig.Context) error {
 			return false
 		},
 		UpdateFunc: func(e event.UpdateEvent) bool {
-			pdb, ok := e.ObjectNew.DeepCopyObject().(*policyv1beta1.PodDisruptionBudget)
+			if usePDBV1Beta1 {
+				pdb, ok := e.ObjectNew.DeepCopyObject().(*policyv1beta1.PodDisruptionBudget)
+				if !ok {
+					return false
+				}
+				return pdb.Name == osdPDBAppName && pdb.Status.DisruptionsAllowed == 0
+			}
+			pdb, ok := e.ObjectNew.DeepCopyObject().(*policyv1.PodDisruptionBudget)
 			if !ok {
 				return false
 			}
@@ -108,24 +115,46 @@ func Add(mgr manager.Manager, context *controllerconfig.Context) error {
 	}
 
 	// Watch for main PodDisruptionBudget and enqueue the CephCluster in the namespace
-	err = c.Watch(
-		&source.Kind{Type: &policyv1beta1.PodDisruptionBudget{}},
-		handler.EnqueueRequestsFromMapFunc(handler.MapFunc(func(obj client.Object) []reconcile.Request {
-			pdb, ok := obj.(*policyv1beta1.PodDisruptionBudget)
-			if !ok {
-				// Not a pdb, returning empty
-				logger.Errorf("PDB handler received non-PDB")
-				return []reconcile.Request{}
-			}
-			namespace := pdb.GetNamespace()
-			req := reconcile.Request{NamespacedName: types.NamespacedName{Namespace: namespace}}
-			return []reconcile.Request{req}
-		}),
-		),
-		pdbPredicate,
-	)
-	if err != nil {
-		return err
+	if usePDBV1Beta1 {
+		err = c.Watch(
+			&source.Kind{Type: &policyv1beta1.PodDisruptionBudget{}},
+			handler.EnqueueRequestsFromMapFunc(handler.MapFunc(func(obj client.Object) []reconcile.Request {
+				pdb, ok := obj.(*policyv1beta1.PodDisruptionBudget)
+				if !ok {
+					// Not a pdb, returning empty
+					logger.Error("PDB handler received non-PDB")
+					return []reconcile.Request{}
+				}
+				namespace := pdb.GetNamespace()
+				req := reconcile.Request{NamespacedName: types.NamespacedName{Namespace: namespace}}
+				return []reconcile.Request{req}
+			}),
+			),
+			pdbPredicate,
+		)
+		if err != nil {
+			return err
+		}
+	} else {
+		err = c.Watch(
+			&source.Kind{Type: &policyv1.PodDisruptionBudget{}},
+			handler.EnqueueRequestsFromMapFunc(handler.MapFunc(func(obj client.Object) []reconcile.Request {
+				pdb, ok := obj.(*policyv1.PodDisruptionBudget)
+				if !ok {
+					// Not a pdb, returning empty
+					logger.Error("PDB handler received non-PDB")
+					return []reconcile.Request{}
+				}
+				namespace := pdb.GetNamespace()
+				req := reconcile.Request{NamespacedName: types.NamespacedName{Namespace: namespace}}
+				return []reconcile.Request{req}
+			}),
+			),
+			pdbPredicate,
+		)
+		if err != nil {
+			return err
+		}
 	}
 
 	// enqueues with an empty name that is populated by the reconciler.

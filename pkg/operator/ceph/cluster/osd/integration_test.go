@@ -37,7 +37,6 @@ import (
 	"github.com/rook/rook/pkg/operator/test"
 	exectest "github.com/rook/rook/pkg/util/exec/test"
 	"github.com/stretchr/testify/assert"
-	"github.com/tevino/abool"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -97,6 +96,7 @@ func TestOSDIntegration(t *testing.T) {
 // This is the actual test. If it hangs, we should consider that an error.
 func testOSDIntegration(t *testing.T) {
 	ctx := context.TODO()
+	contextCancel, cancel := context.WithCancel(ctx)
 	namespace := "osd-integration"
 	clusterName := "my-cluster"
 
@@ -109,7 +109,7 @@ func testOSDIntegration(t *testing.T) {
 	}()
 	// stub out the conditionExportFunc to do nothing. we do not have a fake Rook interface that
 	// allows us to interact with a CephCluster resource like the fake K8s clientset.
-	updateConditionFunc = func(c *clusterd.Context, namespaceName types.NamespacedName, conditionType cephv1.ConditionType, status corev1.ConditionStatus, reason cephv1.ClusterReasonType, message string) {
+	updateConditionFunc = func(ctx context.Context, c *clusterd.Context, namespaceName types.NamespacedName, observedGeneration int64, conditionType cephv1.ConditionType, status corev1.ConditionStatus, reason cephv1.ConditionReason, message string) {
 		// do nothing
 	}
 
@@ -191,19 +191,19 @@ func testOSDIntegration(t *testing.T) {
 	clusterInfo.CephVersion = cephver.Pacific
 	clusterInfo.SetName("mycluster")
 	clusterInfo.OwnerInfo = cephclient.NewMinimumOwnerInfo(t)
+	clusterInfo.Context = ctx
 	executor := osdIntegrationTestExecutor(t, clientset, namespace)
 
-	context := &clusterd.Context{
-		Clientset:                  clientset,
-		ConfigDir:                  "/var/lib/rook",
-		Executor:                   executor,
-		RequestCancelOrchestration: abool.New(),
+	rootCtx := &clusterd.Context{
+		Clientset: clientset,
+		ConfigDir: "/var/lib/rook",
+		Executor:  executor,
 	}
 	spec := cephv1.ClusterSpec{
 		CephVersion: cephv1.CephVersionSpec{
-			Image: "ceph/ceph:v16.2.0",
+			Image: "quay.io/ceph/ceph:v16.2.0",
 		},
-		DataDirHostPath: context.ConfigDir,
+		DataDirHostPath: rootCtx.ConfigDir,
 		// This storage spec should... (see inline)
 		Storage: cephv1.StorageScopeSpec{
 			UseAllNodes: true,
@@ -221,13 +221,14 @@ func testOSDIntegration(t *testing.T) {
 	}
 	osdsPerNode := 2 // vda and vdb
 
-	c := New(context, clusterInfo, spec, "myversion")
+	c := New(rootCtx, clusterInfo, spec, "myversion")
 
 	var startErr error
 	var done bool
-	runReconcile := func() {
+	runReconcile := func(ctx context.Context) {
 		// reset environment
-		c = New(context, clusterInfo, spec, "myversion")
+		c = New(rootCtx, clusterInfo, spec, "myversion")
+		clusterInfo.Context = ctx
 		statusMapWatcher.Reset()
 
 		// reset counters
@@ -249,7 +250,7 @@ func testOSDIntegration(t *testing.T) {
 
 	// NOTE: these tests all use the same environment
 	t.Run("initial creation", func(t *testing.T) {
-		go runReconcile()
+		go runReconcile(contextCancel)
 
 		cms := waitForNumConfigMaps(clientset, namespace, 12) // 3 nodes + 9 new PVCs
 		for _, cm := range cms {
@@ -265,7 +266,7 @@ func testOSDIntegration(t *testing.T) {
 	})
 
 	t.Run("reconcile again with no changes", func(t *testing.T) {
-		go runReconcile()
+		go runReconcile(contextCancel)
 
 		cms := waitForNumConfigMaps(clientset, namespace, 3) // 3 nodes
 		for _, cm := range cms {
@@ -286,7 +287,7 @@ func testOSDIntegration(t *testing.T) {
 		spec.Storage.StorageClassDeviceSets[1].Count = 6     // 3 more (1 more per node)
 		osdsPerNode = 3                                      // vda, vdb, vdc
 
-		go runReconcile()
+		go runReconcile(contextCancel)
 
 		cms := waitForNumConfigMaps(clientset, namespace, 8) // 3 nodes + 5 new PVCs
 		for _, cm := range cms {
@@ -306,7 +307,7 @@ func testOSDIntegration(t *testing.T) {
 		spec.Storage.StorageClassDeviceSets[0].Count = 10     // 2 more portable
 		osdsPerNode = 4                                       // vd[a-d]
 
-		go runReconcile()
+		go runReconcile(contextCancel)
 		cms := waitForNumConfigMaps(clientset, namespace, 5) // 3 nodes + 2 new PVCs
 		i := 1
 		for _, cm := range cms {
@@ -323,7 +324,9 @@ func testOSDIntegration(t *testing.T) {
 				time.Sleep(10 * time.Millisecond)
 				// after the second status map is made ready, cancel the orchestration. wait a short
 				// while to make sure the watcher picks up the updated change
-				c.context.RequestCancelOrchestration.Set()
+				cancel()
+				// refresh the context so the rest of the test can continue
+				contextCancel = context.TODO()
 				break
 			}
 			i++
@@ -337,7 +340,7 @@ func testOSDIntegration(t *testing.T) {
 		numUpdates := len(deploymentsUpdated)
 		t.Logf("deployments updated: %d", numUpdates)
 
-		go runReconcile()
+		go runReconcile(contextCancel)
 		cms = waitForNumConfigMaps(clientset, namespace, 5) // 3 nodes + 2 new PVCs
 		for _, cm := range cms {
 			cpy := cm.DeepCopy()
@@ -354,7 +357,7 @@ func testOSDIntegration(t *testing.T) {
 		spec.Storage.Selection.DeviceFilter = "/dev/vd[abcde]" // 3 more (1 more per node)
 		osdsPerNode = 5                                        // vd[a-e]
 
-		go runReconcile()
+		go runReconcile(contextCancel)
 		cms := waitForNumConfigMaps(clientset, namespace, 3) // 3 nodes
 		for _, cm := range cms {
 			cpy := cm.DeepCopy()
@@ -372,7 +375,7 @@ func testOSDIntegration(t *testing.T) {
 		assert.Len(t, deploymentsUpdated, 28)
 
 		// should get back to healthy after
-		go runReconcile()
+		go runReconcile(contextCancel)
 		cms = waitForNumConfigMaps(clientset, namespace, 3) // 3 nodes
 		for _, cm := range cms {
 			cpy := cm.DeepCopy()
@@ -387,7 +390,7 @@ func testOSDIntegration(t *testing.T) {
 
 	t.Run("failures during deployment updates", func(t *testing.T) {
 		failUpdatingDeployments = []string{"osd-15", "osd-22"}
-		go runReconcile()
+		go runReconcile(contextCancel)
 		cms := waitForNumConfigMaps(clientset, namespace, 3) // 3 nodes
 		for _, cm := range cms {
 			cpy := cm.DeepCopy()
@@ -401,7 +404,7 @@ func testOSDIntegration(t *testing.T) {
 		assert.Len(t, deploymentsUpdated, 31) // should attempt to update all deployments
 
 		failUpdatingDeployments = []string{}
-		go runReconcile()
+		go runReconcile(contextCancel)
 		cms = waitForNumConfigMaps(clientset, namespace, 3) // 3 nodes
 		for _, cm := range cms {
 			cpy := cm.DeepCopy()
@@ -419,7 +422,7 @@ func testOSDIntegration(t *testing.T) {
 		osdsPerNode = 6                                         // vd[a-f]
 
 		failCreatingDeployments = []string{"osd-31", "osd-33"}
-		go runReconcile()
+		go runReconcile(contextCancel)
 		cms := waitForNumConfigMaps(clientset, namespace, 3) // 3 nodes
 		for _, cm := range cms {
 			cpy := cm.DeepCopy()
@@ -433,7 +436,7 @@ func testOSDIntegration(t *testing.T) {
 		assert.Len(t, deploymentsUpdated, 31)
 
 		failCreatingDeployments = []string{}
-		go runReconcile()
+		go runReconcile(contextCancel)
 		cms = waitForNumConfigMaps(clientset, namespace, 3) // 3 nodes
 		for _, cm := range cms {
 			cpy := cm.DeepCopy()
@@ -455,7 +458,7 @@ func testOSDIntegration(t *testing.T) {
 		}
 		spec.Storage.StorageClassDeviceSets = append(spec.Storage.StorageClassDeviceSets, newSCDS)
 
-		go runReconcile()
+		go runReconcile(contextCancel)
 		cms := waitForNumConfigMaps(clientset, namespace, 3) // 3 nodes
 		for _, cm := range cms {
 			cpy := cm.DeepCopy()
@@ -473,7 +476,7 @@ func testOSDIntegration(t *testing.T) {
 			newDummyPVC("metadata", namespace, "10Gi", "uncle-rogers-secret-stuff"),
 		}
 
-		go runReconcile()
+		go runReconcile(contextCancel)
 		cms = waitForNumConfigMaps(clientset, namespace, 6) // 3 nodes + 3 new PVCs
 		for _, cm := range cms {
 			cpy := cm.DeepCopy()
@@ -497,7 +500,7 @@ func testOSDIntegration(t *testing.T) {
 		_, err := clientset.CoreV1().ConfigMaps(namespace).Create(ctx, danglingCM, metav1.CreateOptions{})
 		assert.NoError(t, err)
 
-		go runReconcile()
+		go runReconcile(contextCancel)
 		cms := waitForNumConfigMaps(clientset, namespace, 4) // 3 nodes + dangling
 		for _, cm := range cms {
 			cpy := cm.DeepCopy()
@@ -524,7 +527,7 @@ func testOSDIntegration(t *testing.T) {
 
 func osdIntegrationTestExecutor(t *testing.T, clientset *fake.Clientset, namespace string) *exectest.MockExecutor {
 	return &exectest.MockExecutor{
-		MockExecuteCommandWithOutputFile: func(command string, outFileArg string, args ...string) (string, error) {
+		MockExecuteCommandWithOutput: func(command string, args ...string) (string, error) {
 			t.Logf("command: %s %v", command, args)
 			if command != "ceph" {
 				return "", errors.Errorf("unexpected command %q with args %v", command, args)
@@ -557,10 +560,15 @@ func osdIntegrationTestExecutor(t *testing.T, clientset *fake.Clientset, namespa
 				if args[1] == "tree" {
 					return cephclientfake.OsdTreeOutput(3, 3), nil // fake output for cluster with 3 nodes having 3 OSDs
 				}
+				if args[1] == "crush" {
+					if args[2] == "get-device-class" {
+						return cephclientfake.OSDDeviceClassOutput(args[3]), nil
+					}
+				}
 			}
 			if args[0] == "versions" {
 				// the update deploy code only cares about the mons from the ceph version command results
-				v := `{"mon":{"ceph version 16.2.2 (somehash) nautilus (stable)":3}}`
+				v := `{"mon":{"ceph version 16.2.2 (somehash) octopus (stable)":3}}`
 				return v, nil
 			}
 			return "", errors.Errorf("unexpected ceph command %q", args)

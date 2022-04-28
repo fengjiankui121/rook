@@ -26,15 +26,13 @@ import (
 	"time"
 
 	"github.com/coreos/pkg/capnslog"
-	"github.com/rook/rook/pkg/clusterd"
+	"github.com/pkg/errors"
 	rookversion "github.com/rook/rook/pkg/version"
-	v1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/errors"
+	kerrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/apimachinery/pkg/util/version"
 	"k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/tools/cache"
 )
 
 var logger = capnslog.NewPackageLogger("github.com/rook/rook", "op-k8sutil")
@@ -73,7 +71,7 @@ func GetK8SVersion(clientset kubernetes.Interface) (*version.Version, error) {
 	index := strings.Index(serverVersion.GitVersion, "+")
 	if index != -1 {
 		newVersion := serverVersion.GitVersion[:index]
-		logger.Infof("returning version %s instead of %s", newVersion, serverVersion.GitVersion)
+		logger.Debugf("returning version %s instead of %s", newVersion, serverVersion.GitVersion)
 		serverVersion.GitVersion = newVersion
 	}
 	return version.MustParseSemantic(serverVersion.GitVersion), nil
@@ -87,6 +85,17 @@ func Hash(s string) string {
 	return hex.EncodeToString(h[:16])
 }
 
+// TruncateNodeNameForJob hashes the nodeName in case it would case the name to be longer than 63 characters
+// and avoids for a K8s 1.22 bug in the job pod name generation. If the job name contains a . or - in a certain
+// position, the pod will fail to create.
+func TruncateNodeNameForJob(format, nodeName string) string {
+	// In k8s 1.22, the job name is truncated an additional 10 characters which can cause an issue
+	// in the generated pod name if it then ends in a non-alphanumeric character. In that case,
+	// we more aggressively generate a hashed job name.
+	jobNameShortenLength := 10
+	return truncateNodeName(format, nodeName, validation.DNS1035LabelMaxLength-jobNameShortenLength)
+}
+
 // TruncateNodeName hashes the nodeName in case it would case the name to be longer than 63 characters
 // WARNING If your format and nodeName as a hash, are longer than 63 chars it won't be truncated!
 // Your format alone should only be 31 chars at max because of MD5 hash being 32 chars.
@@ -96,9 +105,14 @@ func Hash(s string) string {
 // Do **NOT** edit this function in a way that would change its output as it needs to
 // provide consistent mappings from string to hash across versions of rook.
 func TruncateNodeName(format, nodeName string) string {
-	if len(nodeName)+len(fmt.Sprintf(format, "")) > validation.DNS1035LabelMaxLength {
+	return truncateNodeName(format, nodeName, validation.DNS1035LabelMaxLength)
+}
+
+// truncateNodeName takes the max length desired for a string and hashes the value if needed to shorten it.
+func truncateNodeName(format, nodeName string, maxLength int) string {
+	if len(nodeName)+len(fmt.Sprintf(format, "")) > maxLength {
 		hashed := Hash(nodeName)
-		logger.Infof("format and nodeName longer than %d chars, nodeName %s will be %s", validation.DNS1035LabelMaxLength, nodeName, hashed)
+		logger.Infof("format and nodeName longer than %d chars, nodeName %s will be %s", maxLength, nodeName, hashed)
 		nodeName = hashed
 	}
 	return fmt.Sprintf(format, nodeName)
@@ -117,7 +131,7 @@ func deleteResourceAndWait(namespace, name, resourceType string,
 	logger.Infof("removing %s %s if it exists", resourceType, name)
 	err := deleteAction(options)
 	if err != nil {
-		if !errors.IsNotFound(err) {
+		if !kerrors.IsNotFound(err) {
 			return fmt.Errorf("failed to delete %s. %+v", name, err)
 		}
 		return nil
@@ -130,7 +144,7 @@ func deleteResourceAndWait(namespace, name, resourceType string,
 		// check for the existence of the resource
 		err = getAction()
 		if err != nil {
-			if errors.IsNotFound(err) {
+			if kerrors.IsNotFound(err) {
 				logger.Infof("confirmed %s does not exist", name)
 				return nil
 			}
@@ -191,18 +205,13 @@ func validateLabelValue(value string) string {
 	return sanitized
 }
 
-// StartOperatorSettingsWatch starts the watch for Operator Settings ConfigMap
-func StartOperatorSettingsWatch(context *clusterd.Context, operatorNamespace, operatorSettingConfigMapName string,
-	addFunc func(obj interface{}), updateFunc func(oldObj, newObj interface{}), deleteFunc func(obj interface{}), stopCh chan struct{}) {
-	_, cacheController := cache.NewInformer(cache.NewFilteredListWatchFromClient(context.Clientset.CoreV1().RESTClient(),
-		"configmaps", operatorNamespace, func(options *metav1.ListOptions) {
-			options.FieldSelector = fmt.Sprintf("%s=%s", "metadata.name", operatorSettingConfigMapName)
-		}), &v1.ConfigMap{},
-		0,
-		cache.ResourceEventHandlerFuncs{
-			AddFunc:    addFunc,
-			UpdateFunc: updateFunc,
-			DeleteFunc: deleteFunc,
-		})
-	go cacheController.Run(stopCh)
+func UsePDBV1Beta1Version(Clientset kubernetes.Interface) (bool, error) {
+	k8sVersion, err := GetK8SVersion(Clientset)
+	if err != nil {
+		return false, errors.Wrap(err, "failed to fetch k8s version")
+	}
+	logger.Debugf("kubernetes version fetched %v", k8sVersion)
+	// minimum k8s version required for v1 PodDisruptionBudget is 'v1.21.0'. Apply v1 if k8s version is at least 'v1.21.0', else apply v1beta1 PodDisruptionBudget.
+	minVersionForPDBV1 := "1.21.0"
+	return k8sVersion.LessThan(version.MustParseSemantic(minVersionForPDBV1)), nil
 }

@@ -21,65 +21,94 @@ import (
 
 	"github.com/pkg/errors"
 	cephv1 "github.com/rook/rook/pkg/apis/ceph.rook.io/v1"
-	opcontroller "github.com/rook/rook/pkg/operator/ceph/controller"
+	"github.com/rook/rook/pkg/operator/ceph/reporting"
+	"github.com/rook/rook/pkg/operator/k8sutil"
 	kerrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/util/retry"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
 
-func (r *ReconcileCephObjectStore) setFailedStatus(name types.NamespacedName, errMessage string, err error) (reconcile.Result, error) {
-	updateStatus(r.client, name, cephv1.ConditionFailure, map[string]string{})
+func (r *ReconcileCephObjectStore) setFailedStatus(observedGeneration int64, name types.NamespacedName, errMessage string, err error) (reconcile.Result, error) {
+	updateStatus(r.opManagerContext, observedGeneration, r.client, name, cephv1.ConditionFailure, map[string]string{})
 	return reconcile.Result{}, errors.Wrapf(err, "%s", errMessage)
 }
 
 // updateStatus updates an object with a given status
-func updateStatus(client client.Client, namespacedName types.NamespacedName, status cephv1.ConditionType, info map[string]string) {
-	objectStore := &cephv1.CephObjectStore{}
-	if err := client.Get(context.TODO(), namespacedName, objectStore); err != nil {
-		if kerrors.IsNotFound(err) {
-			logger.Debug("CephObjectStore resource not found. Ignoring since object must be deleted.")
-			return
+func updateStatus(ctx context.Context, observedGeneration int64, client client.Client, namespacedName types.NamespacedName, status cephv1.ConditionType, info map[string]string) {
+	// Updating the status is important to users, but we can still keep operating if there is a
+	// failure. Retry a few times to give it our best effort attempt.
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		objectStore := &cephv1.CephObjectStore{}
+		if err := client.Get(ctx, namespacedName, objectStore); err != nil {
+			if kerrors.IsNotFound(err) {
+				logger.Debug("CephObjectStore resource not found. Ignoring since object must be deleted.")
+				return nil
+			}
+			return errors.Wrapf(err, "failed to retrieve object store %q to update status to %q", namespacedName.String(), status)
 		}
-		logger.Warningf("failed to retrieve object store %q to update status to %q. %v", namespacedName, status, err)
-		return
-	}
-	if objectStore.Status == nil {
-		objectStore.Status = &cephv1.ObjectStoreStatus{}
+		if objectStore.Status == nil {
+			objectStore.Status = &cephv1.ObjectStoreStatus{}
+		}
+
+		if objectStore.Status.Phase == cephv1.ConditionDeleting {
+			logger.Debugf("object store %q status not updated to %q because it is deleting", namespacedName.String(), status)
+			return nil // do not transition to other statuses once deletion begins
+		}
+
+		objectStore.Status.Phase = status
+		objectStore.Status.Info = info
+		if observedGeneration != k8sutil.ObservedGenerationNotAvailable {
+			objectStore.Status.ObservedGeneration = observedGeneration
+		}
+
+		if err := reporting.UpdateStatus(client, objectStore); err != nil {
+			return errors.Wrapf(err, "failed to set object store %q status to %q", namespacedName.String(), status)
+		}
+		return nil
+	})
+	if err != nil {
+		logger.Error(err)
 	}
 
-	objectStore.Status.Phase = status
-	objectStore.Status.Info = info
-
-	if err := opcontroller.UpdateStatus(client, objectStore); err != nil {
-		logger.Errorf("failed to set object store %q status to %q. %v", namespacedName, status, err)
-		return
-	}
-	logger.Debugf("object store %q status updated to %q", namespacedName, status)
+	logger.Debugf("object store %q status updated to %q", namespacedName.String(), status)
 }
 
 // updateStatusBucket updates an object with a given status
-func updateStatusBucket(client client.Client, name types.NamespacedName, phase cephv1.ConditionType, details string) {
-	objectStore := &cephv1.CephObjectStore{}
-	if err := client.Get(context.TODO(), name, objectStore); err != nil {
-		if kerrors.IsNotFound(err) {
-			logger.Debug("CephObjectStore resource not found. Ignoring since object must be deleted.")
-			return
+func updateStatusBucket(ctx context.Context, client client.Client, name types.NamespacedName, status cephv1.ConditionType, details string) {
+	// Updating the status is important to users, but we can still keep operating if there is a
+	// failure. Retry a few times to give it our best effort attempt.
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		objectStore := &cephv1.CephObjectStore{}
+		if err := client.Get(ctx, name, objectStore); err != nil {
+			if kerrors.IsNotFound(err) {
+				logger.Debug("CephObjectStore resource not found. Ignoring since object must be deleted.")
+				return nil
+			}
+			return errors.Wrapf(err, "failed to retrieve object store %q to update status to %v", name.String(), status)
 		}
-		logger.Warningf("failed to retrieve object store %q to update status to %v. %v", name, phase, err)
-		return
-	}
-	if objectStore.Status == nil {
-		objectStore.Status = &cephv1.ObjectStoreStatus{}
-	}
-	objectStore.Status.BucketStatus = toCustomResourceStatus(objectStore.Status.BucketStatus, details, phase)
-	objectStore.Status.Phase = phase
-	if err := opcontroller.UpdateStatus(client, objectStore); err != nil {
-		logger.Errorf("failed to set object store %q status to %v. %v", name, phase, err)
-		return
+		if objectStore.Status == nil {
+			objectStore.Status = &cephv1.ObjectStoreStatus{}
+		}
+		objectStore.Status.BucketStatus = toCustomResourceStatus(objectStore.Status.BucketStatus, details, status)
+
+		// do not transition to other statuses once deletion begins
+		if objectStore.Status.Phase != cephv1.ConditionDeleting {
+			objectStore.Status.Phase = status
+		}
+
+		// but we still need to update the health checker status
+		if err := reporting.UpdateStatus(client, objectStore); err != nil {
+			return errors.Wrapf(err, "failed to set object store %q status to %v", name.String(), status)
+		}
+		return nil
+	})
+	if err != nil {
+		logger.Error(err)
 	}
 
-	logger.Debugf("object store %q status updated to %v", name, phase)
+	logger.Debugf("object store %q status updated to %v", name.String(), status)
 }
 
 func buildStatusInfo(cephObjectStore *cephv1.CephObjectStore) map[string]string {

@@ -26,7 +26,7 @@ labels: bug
 
  To get logs, use `kubectl -n <namespace> logs <pod name>`
 When pasting logs, always surround them with backticks or use the `insert code` button from the Github UI.
-Read [Github documentation if you need help](https://help.github.com/en/articles/creating-and-highlighting-code-blocks).
+Read [GitHub documentation if you need help](https://help.github.com/en/articles/creating-and-highlighting-code-blocks).
 
 **Environment**:
 * OS (e.g. from /etc/os-release):
@@ -36,4 +36,4 @@ Read [Github documentation if you need help](https://help.github.com/en/articles
 * Storage backend version (e.g. for ceph do `ceph -v`):
 * Kubernetes version (use `kubectl version`):
 * Kubernetes cluster type (e.g. Tectonic, GKE, OpenShift):
-* Storage backend status (e.g. for Ceph use `ceph health` in the [Rook Ceph toolbox](https://rook.io/docs/rook/master/ceph-toolbox.html)):
+* Storage backend status (e.g. for Ceph use `ceph health` in the [Rook Ceph toolbox](https://rook.io/docs/rook/latest/ceph-toolbox.html)):

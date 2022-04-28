@@ -29,6 +29,20 @@ import (
 // will be registered for the validating webhook.
 var _ webhook.Validator = &CephCluster{}
 
+// RequireMsgr2 checks if the network settings require the msgr2 protocol
+func (c *ClusterSpec) RequireMsgr2() bool {
+	if c.Network.Connections == nil {
+		return false
+	}
+	if c.Network.Connections.Compression != nil && c.Network.Connections.Compression.Enabled {
+		return true
+	}
+	if c.Network.Connections.Encryption != nil && c.Network.Connections.Encryption.Enabled {
+		return true
+	}
+	return false
+}
+
 func (c *ClusterSpec) IsStretchCluster() bool {
 	return c.Mon.StretchCluster != nil && len(c.Mon.StretchCluster.Zones) > 0
 }
@@ -55,10 +69,6 @@ func (c *CephCluster) ValidateDelete() error {
 }
 
 func validateUpdatedCephCluster(updatedCephCluster *CephCluster, found *CephCluster) error {
-	if updatedCephCluster.Spec.Mon.Count > 0 && updatedCephCluster.Spec.Mon.Count%2 == 0 {
-		return errors.Errorf("mon count %d cannot be even, must be odd to support a healthy quorum", updatedCephCluster.Spec.Mon.Count)
-	}
-
 	if updatedCephCluster.Spec.DataDirHostPath != found.Spec.DataDirHostPath {
 		return errors.Errorf("invalid update: DataDirHostPath change from %q to %q is not allowed", found.Spec.DataDirHostPath, updatedCephCluster.Spec.DataDirHostPath)
 	}
@@ -78,4 +88,8 @@ func validateUpdatedCephCluster(updatedCephCluster *CephCluster, found *CephClus
 	}
 
 	return nil
+}
+
+func (c *CephCluster) GetStatusConditions() *[]Condition {
+	return &c.Status.Conditions
 }

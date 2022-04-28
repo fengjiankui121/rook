@@ -60,7 +60,7 @@ func testDeploymentObject(t *testing.T, network cephv1.NetworkSpec) (*apps.Deplo
 	}
 	clusterInfo := &cephclient.ClusterInfo{
 		FSID:        "myfsid",
-		CephVersion: cephver.Nautilus,
+		CephVersion: cephver.Octopus,
 	}
 	clientset := testop.New(t, 1)
 
@@ -68,11 +68,10 @@ func testDeploymentObject(t *testing.T, network cephv1.NetworkSpec) (*apps.Deplo
 		clusterInfo,
 		&clusterd.Context{Clientset: clientset},
 		&cephv1.ClusterSpec{
-			CephVersion: cephv1.CephVersionSpec{Image: "ceph/ceph:testversion"},
+			CephVersion: cephv1.CephVersionSpec{Image: "quay.io/ceph/ceph:testversion"},
 			Network:     network,
 		},
 		fs,
-		&cephclient.CephFilesystemDetails{ID: 15},
 		&k8sutil.OwnerInfo{},
 		"/var/lib/rook/",
 	)
@@ -81,6 +80,17 @@ func testDeploymentObject(t *testing.T, network cephv1.NetworkSpec) (*apps.Deplo
 		ResourceName: "rook-ceph-mds-myfs-a",
 		DataPathMap:  config.NewStatelessDaemonDataPathMap(config.MdsType, "myfs-a", "rook-ceph", "/var/lib/rook/"),
 	}
+	t.Run(("check mds ConfigureProbe"), func(t *testing.T) {
+		c.fs.Spec.MetadataServer.StartupProbe = &cephv1.ProbeSpec{Disabled: false, Probe: &v1.Probe{InitialDelaySeconds: 1000}}
+		c.fs.Spec.MetadataServer.LivenessProbe = &cephv1.ProbeSpec{Disabled: false, Probe: &v1.Probe{InitialDelaySeconds: 900}}
+		deployment, err := c.makeDeployment(mdsTestConfig, "ns")
+		assert.Nil(t, err)
+		assert.NotNil(t, deployment)
+		assert.NotNil(t, c.fs.Spec.MetadataServer.LivenessProbe)
+		assert.NotNil(t, c.fs.Spec.MetadataServer.StartupProbe)
+		assert.Equal(t, int32(900), deployment.Spec.Template.Spec.Containers[0].LivenessProbe.InitialDelaySeconds)
+		assert.Equal(t, int32(1000), deployment.Spec.Template.Spec.Containers[0].StartupProbe.InitialDelaySeconds)
+	})
 	return c.makeDeployment(mdsTestConfig, "ns")
 }
 
@@ -93,12 +103,12 @@ func TestPodSpecs(t *testing.T) {
 
 	// Deployment should have Ceph labels
 	test.AssertLabelsContainCephRequirements(t, d.ObjectMeta.Labels,
-		config.MdsType, "myfs-a", "rook-ceph-mds", "ns")
+		config.MdsType, "myfs-a", "rook-ceph-mds", "ns", "myfs", "cephfilesystems.ceph.rook.io", "ceph-mds")
 
 	podTemplate := test.NewPodTemplateSpecTester(t, &d.Spec.Template)
-	podTemplate.RunFullSuite(config.MdsType, "myfs-a", "rook-ceph-mds", "ns", "ceph/ceph:testversion",
+	podTemplate.RunFullSuite(config.MdsType, "myfs-a", "rook-ceph-mds", "ns", "quay.io/ceph/ceph:testversion",
 		"500", "250", "4337", "2169", /* resources */
-		"my-priority-class")
+		"my-priority-class", "myfs", "cephfilesystems.ceph.rook.io", "ceph-mds")
 
 	// assert --public-addr is appended to args
 	assert.Contains(t, d.Spec.Template.Spec.Containers[0].Args,

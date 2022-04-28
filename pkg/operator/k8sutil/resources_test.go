@@ -37,17 +37,18 @@ func TestMergeResourceRequirements(t *testing.T) {
 	first = v1.ResourceRequirements{}
 	second = v1.ResourceRequirements{
 		Limits: v1.ResourceList{
-			v1.ResourceCPU: *resource.NewQuantity(100.0, resource.BinarySI),
+			v1.ResourceCPU:     *resource.NewQuantity(100.0, resource.BinarySI),
+			v1.ResourceStorage: *resource.NewQuantity(50.0, resource.BinarySI),
 		},
 		Requests: v1.ResourceList{
-			v1.ResourceMemory: *resource.NewQuantity(1337.0, resource.BinarySI),
+			v1.ResourceName("foo"): *resource.NewQuantity(23.0, resource.BinarySI),
 		},
 	}
 	result = MergeResourceRequirements(first, second)
-	assert.Equal(t, 1, len(result.Limits))
+	assert.Equal(t, 2, len(result.Limits))
 	assert.Equal(t, 1, len(result.Requests))
 	assert.Equal(t, "100", result.Limits.Cpu().String())
-	assert.Equal(t, "1337", result.Requests.Memory().String())
+	assert.Equal(t, "50", result.Limits.Storage().String())
 
 	first = v1.ResourceRequirements{
 		Limits: v1.ResourceList{
@@ -141,4 +142,25 @@ func TestValidateController(t *testing.T) {
 	newOwnerInfo := NewOwnerInfoWithOwnerRef(newControllerRef, "")
 	err = newOwnerInfo.validateController(object)
 	assert.Error(t, err)
+}
+
+func TestSetOwnerReference(t *testing.T) {
+	info := OwnerInfo{
+		ownerRef: &metav1.OwnerReference{Name: "test-id"},
+	}
+	object := v1.ConfigMap{}
+	err := info.SetOwnerReference(&object)
+	assert.NoError(t, err)
+	assert.Equal(t, object.GetOwnerReferences(), []metav1.OwnerReference{*info.ownerRef})
+
+	err = info.SetOwnerReference(&object)
+	assert.NoError(t, err)
+	assert.Equal(t, object.GetOwnerReferences(), []metav1.OwnerReference{*info.ownerRef})
+
+	info2 := OwnerInfo{
+		ownerRef: &metav1.OwnerReference{Name: "test-id-2"},
+	}
+	err = info2.SetOwnerReference(&object)
+	assert.NoError(t, err)
+	assert.Equal(t, object.GetOwnerReferences(), []metav1.OwnerReference{*info.ownerRef, *info2.ownerRef})
 }

@@ -24,18 +24,19 @@ import (
 
 	cephv1 "github.com/rook/rook/pkg/apis/ceph.rook.io/v1"
 	rookclient "github.com/rook/rook/pkg/client/clientset/versioned/fake"
-	"github.com/rook/rook/pkg/operator/test"
-
 	"github.com/rook/rook/pkg/clusterd"
 	cephclient "github.com/rook/rook/pkg/daemon/ceph/client"
 	"github.com/rook/rook/pkg/operator/k8sutil"
+	"github.com/rook/rook/pkg/operator/test"
 	exectest "github.com/rook/rook/pkg/util/exec/test"
 	"github.com/stretchr/testify/assert"
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	k8sfake "k8s.io/client-go/kubernetes/fake"
 	"k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/client-go/tools/record"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
@@ -98,7 +99,7 @@ func TestCephObjectRealmController(t *testing.T) {
 	// Create a fake client to mock API calls.
 	cl := fake.NewClientBuilder().WithScheme(r.scheme).WithRuntimeObjects(object...).Build()
 	// Create a ReconcileObjectRealm object with the scheme and fake client.
-	r = &ReconcileObjectRealm{client: cl, scheme: r.scheme, context: r.context}
+	r = &ReconcileObjectRealm{client: cl, scheme: r.scheme, context: r.context, recorder: record.NewFakeRecorder(5)}
 	res, err = r.Reconcile(ctx, req)
 	assert.NoError(t, err)
 	assert.True(t, res.Requeue)
@@ -134,13 +135,10 @@ func TestCephObjectRealmController(t *testing.T) {
 	cl = fake.NewClientBuilder().WithScheme(r.scheme).WithRuntimeObjects(object...).Build()
 
 	executor := &exectest.MockExecutor{
-		MockExecuteCommandWithOutputFile: func(command, outfile string, args ...string) (string, error) {
+		MockExecuteCommandWithOutput: func(command string, args ...string) (string, error) {
 			if args[0] == "status" {
 				return `{"fsid":"c47cac40-9bee-4d52-823b-ccd803ba5bfe","health":{"checks":{},"status":"HEALTH_OK"},"pgmap":{"num_pgs":100,"pgs_by_state":[{"state_name":"active+clean","count":100}]}}`, nil
 			}
-			return "", nil
-		},
-		MockExecuteCommandWithOutput: func(command string, args ...string) (string, error) {
 			if args[0] == "realm" && args[1] == "get" {
 				return realmGetJSON, nil
 			}
@@ -157,7 +155,7 @@ func TestCephObjectRealmController(t *testing.T) {
 	r.context.Executor = executor
 
 	// Create a ReconcileObjectRealm object with the scheme and fake client.
-	r = &ReconcileObjectRealm{client: cl, scheme: r.scheme, context: r.context}
+	r = &ReconcileObjectRealm{client: cl, scheme: r.scheme, context: r.context, recorder: record.NewFakeRecorder(5)}
 
 	res, err = r.Reconcile(ctx, req)
 	assert.NoError(t, err)
@@ -230,7 +228,7 @@ func getObjectRealmAndReconcileObjectRealm(t *testing.T) (*ReconcileObjectRealm,
 	}
 
 	executor := &exectest.MockExecutor{
-		MockExecuteCommandWithOutputFile: func(command, outfile string, args ...string) (string, error) {
+		MockExecuteCommandWithOutput: func(command string, args ...string) (string, error) {
 			if args[0] == "status" {
 				return `{"fsid":"c47cac40-9bee-4d52-823b-ccd803ba5bfe","health":{"checks":{},"status":"HEALTH_ERR"},"pgmap":{"num_pgs":100,"pgs_by_state":[{"state_name":"active+clean","count":100}]}}`, nil
 			}
@@ -258,8 +256,80 @@ func getObjectRealmAndReconcileObjectRealm(t *testing.T) (*ReconcileObjectRealm,
 	// Create a fake client to mock API calls.
 	cl := fake.NewClientBuilder().WithScheme(s).WithRuntimeObjects(object...).Build()
 	// Create a ReconcileObjectRealm object with the scheme and fake client.
-	clusterInfo := cephclient.AdminClusterInfo("rook")
-	r := &ReconcileObjectRealm{client: cl, scheme: s, context: c, clusterInfo: clusterInfo}
+	clusterInfo := cephclient.AdminTestClusterInfo("rook")
+	r := &ReconcileObjectRealm{client: cl, scheme: s, context: c, clusterInfo: clusterInfo, recorder: record.NewFakeRecorder(5)}
 
 	return r, objectRealm
+}
+
+func TestReconcileObjectRealm_createRealmKeys(t *testing.T) {
+	ctx := context.TODO()
+	realmName := "my-realm"
+	ns := "my-ns"
+
+	scheme := scheme.Scheme
+	scheme.AddKnownTypes(cephv1.SchemeGroupVersion, &cephv1.CephObjectRealm{}, &cephv1.CephCluster{}, &cephv1.CephClusterList{})
+
+	realm := &cephv1.CephObjectRealm{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      realmName,
+			Namespace: ns,
+		},
+		TypeMeta: metav1.TypeMeta{
+			Kind: "CephObjectRealm",
+		},
+	}
+
+	t.Run("should be idempotent", func(t *testing.T) {
+		r := ReconcileObjectRealm{
+			context: &clusterd.Context{
+				Clientset: k8sfake.NewSimpleClientset(),
+			},
+			scheme:   scheme,
+			recorder: record.NewFakeRecorder(5),
+		}
+
+		for _, tName := range []string{"first reconcile", "second reconcile"} {
+			// the output should be the same on the first and subsequent reconciles
+			t.Run(tName, func(t *testing.T) {
+				res, err := r.createRealmKeys(realm)
+				assert.NoError(t, err)
+				assert.True(t, res.IsZero())
+
+				secret, err := r.context.Clientset.CoreV1().Secrets(ns).Get(ctx, realmName+"-keys", metav1.GetOptions{})
+				assert.NoError(t, err)
+				assert.Contains(t, secret.Data, "access-key")
+				assert.Contains(t, secret.Data, "secret-key")
+			})
+		}
+	})
+
+	t.Run("should fail if the secret doesn't have the necessary keys", func(t *testing.T) {
+		secret := &v1.Secret{
+			TypeMeta: metav1.TypeMeta{
+				Kind:       "Secret",
+				APIVersion: v1.SchemeGroupVersion.String(),
+			},
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: ns,
+				Name:      realmName + "-keys",
+			},
+			Data: map[string][]byte{
+				"access-key": []byte("my-access-key"),
+				// missing "secret-key"
+			},
+		}
+
+		r := ReconcileObjectRealm{
+			context: &clusterd.Context{
+				Clientset: k8sfake.NewSimpleClientset(secret),
+			},
+			scheme:   scheme,
+			recorder: record.NewFakeRecorder(5),
+		}
+
+		_, err := r.createRealmKeys(realm)
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "user likely created or modified the secret manually and should add the missing key back into the secret")
+	})
 }

@@ -19,19 +19,12 @@ package client
 import (
 	"encoding/json"
 	"fmt"
-	"os"
 	"strconv"
 	"time"
 
 	"github.com/pkg/errors"
 	"github.com/rook/rook/pkg/clusterd"
 	"k8s.io/apimachinery/pkg/util/wait"
-)
-
-const (
-	// MultiFsEnv defines the name of the Rook environment variable which controls if Rook is
-	// allowed to create multiple Ceph filesystems.
-	MultiFsEnv = "ROOK_ALLOW_MULTIPLE_FILESYSTEMS"
 )
 
 type MDSDump struct {
@@ -132,7 +125,7 @@ func AllowStandbyReplay(context *clusterd.Context, clusterInfo *ClusterInfo, fsN
 }
 
 // CreateFilesystem performs software configuration steps for Ceph to provide a new filesystem.
-func CreateFilesystem(context *clusterd.Context, clusterInfo *ClusterInfo, name, metadataPool string, dataPools []string, force bool) error {
+func CreateFilesystem(context *clusterd.Context, clusterInfo *ClusterInfo, name, metadataPool string, dataPools []string) error {
 	if len(dataPools) == 0 {
 		return errors.New("at least one data pool is required")
 	}
@@ -141,7 +134,7 @@ func CreateFilesystem(context *clusterd.Context, clusterInfo *ClusterInfo, name,
 	var err error
 
 	// Always enable multiple fs when running on Pacific
-	if IsMultiFSEnabled() || clusterInfo.CephVersion.IsAtLeastPacific() {
+	if clusterInfo.CephVersion.IsAtLeastPacific() {
 		// enable multiple file systems in case this is not the first
 		args := []string{"fs", "flag", "set", "enable_multiple", "true", confirmFlag}
 		_, err = NewCephCommand(context, clusterInfo, args).Run()
@@ -152,11 +145,7 @@ func CreateFilesystem(context *clusterd.Context, clusterInfo *ClusterInfo, name,
 
 	// create the filesystem
 	args := []string{"fs", "new", name, metadataPool, dataPools[0]}
-	// Force to use pre-existing pools
-	if force {
-		args = append(args, "--force")
-		logger.Infof("Filesystem %q will reuse pre-existing pools", name)
-	}
+
 	_, err = NewCephCommand(context, clusterInfo, args).Run()
 	if err != nil {
 		return errors.Wrapf(err, "failed enabling ceph fs %q", name)
@@ -181,13 +170,6 @@ func AddDataPoolToFilesystem(context *clusterd.Context, clusterInfo *ClusterInfo
 		return errors.Wrapf(err, "failed to add pool %q to file system %q. (%v)", poolName, name, err)
 	}
 	return nil
-}
-
-// IsMultiFSEnabled returns true if ROOK_ALLOW_MULTIPLE_FILESYSTEMS is set to "true", allowing
-// Rook to create multiple Ceph filesystems. False if Rook is not allowed to do so.
-func IsMultiFSEnabled() bool {
-	t := os.Getenv(MultiFsEnv)
-	return t == "true"
 }
 
 // SetNumMDSRanks sets the number of mds ranks (max_mds) for a Ceph filesystem.
@@ -302,8 +284,7 @@ func FailMDS(context *clusterd.Context, clusterInfo *ClusterInfo, gid int) error
 }
 
 // FailFilesystem efficiently brings down the filesystem by marking the filesystem as down
-// and failing the MDSes using a single Ceph command. This works only from nautilus version
-// of Ceph onwards.
+// and failing the MDSes using a single Ceph command.
 func FailFilesystem(context *clusterd.Context, clusterInfo *ClusterInfo, fsName string) error {
 	args := []string{"fs", "fail", fsName}
 	_, err := NewCephCommand(context, clusterInfo, args).Run()

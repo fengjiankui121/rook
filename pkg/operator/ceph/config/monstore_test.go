@@ -20,6 +20,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/pkg/errors"
 	"github.com/rook/rook/pkg/clusterd"
@@ -41,8 +42,8 @@ func TestMonStore_Set(t *testing.T) {
 	// us to cause it to return an error when it detects a keyword.
 	execedCmd := ""
 	execInjectErr := false
-	executor.MockExecuteCommandWithOutputFile =
-		func(command string, outfile string, args ...string) (string, error) {
+	executor.MockExecuteCommandWithTimeout =
+		func(timeout time.Duration, command string, args ...string) (string, error) {
 			execedCmd = command + " " + strings.Join(args, " ")
 			if execInjectErr {
 				return "output from cmd with error", errors.New("mocked error")
@@ -50,7 +51,7 @@ func TestMonStore_Set(t *testing.T) {
 			return "", nil
 		}
 
-	monStore := GetMonStore(ctx, &client.ClusterInfo{Namespace: "ns"})
+	monStore := GetMonStore(ctx, client.AdminTestClusterInfo("mycluster"))
 
 	// setting with spaces converts to underscores
 	e := monStore.Set("global", "debug ms", "10")
@@ -86,8 +87,8 @@ func TestMonStore_Delete(t *testing.T) {
 	// us to cause it to return an error when it detects a keyword.
 	execedCmd := ""
 	execInjectErr := false
-	executor.MockExecuteCommandWithOutputFile =
-		func(command string, outfile string, args ...string) (string, error) {
+	executor.MockExecuteCommandWithTimeout =
+		func(timeout time.Duration, command string, args ...string) (string, error) {
 			execedCmd = command + " " + strings.Join(args, " ")
 			if execInjectErr {
 				return "output from cmd with error", errors.New("mocked error")
@@ -95,7 +96,7 @@ func TestMonStore_Delete(t *testing.T) {
 			return "", nil
 		}
 
-	monStore := GetMonStore(ctx, &client.ClusterInfo{Namespace: "ns"})
+	monStore := GetMonStore(ctx, client.AdminTestClusterInfo("mycluster"))
 
 	// ceph config rm called as expected
 	e := monStore.Delete("global", "debug ms")
@@ -125,8 +126,8 @@ func TestMonStore_GetDaemon(t *testing.T) {
 		"\"rgw_enable_usage_log\":{\"value\":\"true\",\"section\":\"client.rgw.test.a\",\"mask\":{}," +
 		"\"can_update_at_runtime\":true}}"
 	execInjectErr := false
-	executor.MockExecuteCommandWithOutputFile =
-		func(command string, outfile string, args ...string) (string, error) {
+	executor.MockExecuteCommandWithTimeout =
+		func(timeout time.Duration, command string, args ...string) (string, error) {
 			execedCmd = command + " " + strings.Join(args, " ")
 			if execInjectErr {
 				return "output from cmd with error", errors.New("mocked error")
@@ -134,7 +135,7 @@ func TestMonStore_GetDaemon(t *testing.T) {
 			return execReturn, nil
 		}
 
-	monStore := GetMonStore(ctx, &client.ClusterInfo{Namespace: "ns"})
+	monStore := GetMonStore(ctx, client.AdminTestClusterInfo("mycluster"))
 
 	// ceph config get called as expected
 	options, e := monStore.GetDaemon("client.rgw.test.a")
@@ -171,13 +172,13 @@ func TestMonStore_DeleteDaemon(t *testing.T) {
 		"\"can_update_at_runtime\":true}," +
 		"\"rgw_enable_usage_log\":{\"value\":\"true\",\"section\":\"client.rgw.test.a\",\"mask\":{}," +
 		"\"can_update_at_runtime\":true}}"
-	executor.MockExecuteCommandWithOutputFile =
-		func(command string, outfile string, args ...string) (string, error) {
+	executor.MockExecuteCommandWithTimeout =
+		func(timeout time.Duration, command string, args ...string) (string, error) {
 			execedCmd = command + " " + strings.Join(args, " ")
 			return execReturn, nil
 		}
 
-	monStore := GetMonStore(ctx, &client.ClusterInfo{Namespace: "ns"})
+	monStore := GetMonStore(ctx, client.AdminTestClusterInfo("mycluster"))
 
 	// ceph config rm rgw_enable_usage_log called as expected
 	e := monStore.DeleteDaemon("client.rgw.test.a")
@@ -197,8 +198,8 @@ func TestMonStore_SetAll(t *testing.T) {
 	// us to cause it to return an error when it detects a keyword.
 	execedCmds := []string{}
 	execInjectErrOnKeyword := "donotinjectanerror"
-	executor.MockExecuteCommandWithOutputFile =
-		func(command string, outfile string, args ...string) (string, error) {
+	executor.MockExecuteCommandWithTimeout =
+		func(timeout time.Duration, command string, args ...string) (string, error) {
 			execedCmd := command + " " + strings.Join(args, " ")
 			execedCmds = append(execedCmds, execedCmd)
 			k := execInjectErrOnKeyword
@@ -208,7 +209,7 @@ func TestMonStore_SetAll(t *testing.T) {
 			return "", nil
 		}
 
-	monStore := GetMonStore(ctx, &client.ClusterInfo{Namespace: "ns"})
+	monStore := GetMonStore(ctx, client.AdminTestClusterInfo("mycluster"))
 
 	cfgOverrides := []Option{
 		configOverride("global", "debug ms", "10"), // setting w/ spaces converts to underscores

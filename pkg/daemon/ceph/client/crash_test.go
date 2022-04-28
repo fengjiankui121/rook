@@ -39,14 +39,14 @@ var (
 func TestCephCrash(t *testing.T) {
 	executor := &exectest.MockExecutor{}
 	context := &clusterd.Context{Executor: executor}
-	executor.MockExecuteCommandWithOutputFile = func(command, outputFile string, args ...string) (string, error) {
+	executor.MockExecuteCommandWithOutput = func(command string, args ...string) (string, error) {
 		logger.Infof("ExecuteCommandWithOutputFile: %s %v", command, args)
 		if args[0] == "crash" && args[1] == "ls" {
 			return fakecrash, nil
 		}
 		return "", errors.Errorf("unexpected ceph command %q", args)
 	}
-	crash, err := GetCrashList(context, AdminClusterInfo("mycluster"))
+	crash, err := GetCrashList(context, AdminTestClusterInfo("mycluster"))
 	assert.NoError(t, err)
 	assert.Equal(t, 1, len(crash))
 }

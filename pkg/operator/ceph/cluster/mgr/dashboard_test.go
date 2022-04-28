@@ -83,42 +83,44 @@ func TestStartSecureDashboard(t *testing.T) {
 	moduleRetries := 0
 	exitCodeResponse := 0
 	clientset := test.New(t, 3)
-	executor := &exectest.MockExecutor{
-		MockExecuteCommandWithOutputFile: func(command string, outFileArg string, args ...string) (string, error) {
-			logger.Infof("command: %s %v", command, args)
-			exitCodeResponse = 0
-			if args[1] == "module" {
-				if args[2] == "enable" {
-					enables++
-				} else if args[2] == "disable" {
-					disables++
-				}
+	mockFN := func(command string, args ...string) (string, error) {
+		logger.Infof("command: %s %v", command, args)
+		exitCodeResponse = 0
+		if args[1] == "module" {
+			if args[2] == "enable" {
+				enables++
+			} else if args[2] == "disable" {
+				disables++
 			}
-			if args[0] == "dashboard" && args[1] == "create-self-signed-cert" {
-				if moduleRetries < 2 {
-					logger.Infof("simulating retry...")
-					exitCodeResponse = invalidArgErrorCode
-					moduleRetries++
-					return "", errors.New("test failure")
-				}
+		}
+		if args[0] == "dashboard" && args[1] == "create-self-signed-cert" {
+			if moduleRetries < 2 {
+				logger.Infof("simulating retry...")
+				exitCodeResponse = invalidArgErrorCode
+				moduleRetries++
+				return "", errors.New("test failure")
 			}
-			return "", nil
-		},
+		}
+		return "", nil
 	}
-	executor.MockExecuteCommandWithOutputFileTimeout = func(timeout time.Duration, command, outfileArg string, arg ...string) (string, error) {
-		return executor.MockExecuteCommandWithOutputFile(command, outfileArg, arg...)
+	executor := &exectest.MockExecutor{
+		MockExecuteCommandWithOutput: mockFN,
+		MockExecuteCommandWithTimeout: func(timeout time.Duration, command string, arg ...string) (string, error) {
+			return mockFN(command, arg...)
+		},
 	}
 
 	ownerInfo := cephclient.NewMinimumOwnerInfoWithOwnerRef()
 	clusterInfo := &cephclient.ClusterInfo{
 		Namespace:   "myns",
-		CephVersion: cephver.Nautilus,
+		CephVersion: cephver.Octopus,
 		OwnerInfo:   ownerInfo,
+		Context:     ctx,
 	}
 	c := &Cluster{clusterInfo: clusterInfo, context: &clusterd.Context{Clientset: clientset, Executor: executor},
 		spec: cephv1.ClusterSpec{
 			Dashboard:   cephv1.DashboardSpec{Port: dashboardPortHTTP, Enabled: true, SSL: true},
-			CephVersion: cephv1.CephVersionSpec{Image: "ceph/ceph:v15"},
+			CephVersion: cephv1.CephVersionSpec{Image: "quay.io/ceph/ceph:v15"},
 		},
 	}
 	c.exitCode = func(err error) (int, bool) {
@@ -158,10 +160,9 @@ func TestStartSecureDashboard(t *testing.T) {
 }
 
 func TestFileBasedPasswordSupported(t *testing.T) {
-	// for Ceph version Nautilus 14.2.17
-	clusterInfo := &cephclient.ClusterInfo{CephVersion: cephver.CephVersion{Major: 14, Minor: 2, Extra: 17}}
+	clusterInfo := &cephclient.ClusterInfo{CephVersion: cephver.CephVersion{Major: 15, Minor: 2, Extra: 9}}
 	value := FileBasedPasswordSupported(clusterInfo)
-	assert.True(t, value)
+	assert.False(t, value)
 
 	// for Ceph version Octopus 15.2.10
 	clusterInfo = &cephclient.ClusterInfo{CephVersion: cephver.CephVersion{Major: 15, Minor: 2, Extra: 10}}
@@ -177,9 +178,4 @@ func TestFileBasedPasswordSupported(t *testing.T) {
 	clusterInfo = &cephclient.ClusterInfo{CephVersion: cephver.CephVersion{Major: 17, Minor: 0, Extra: 0}}
 	value = FileBasedPasswordSupported(clusterInfo)
 	assert.True(t, value)
-
-	// for other Ceph Versions
-	clusterInfo = &cephclient.ClusterInfo{CephVersion: cephver.CephVersion{Major: 14, Minor: 2, Extra: 15}}
-	value = FileBasedPasswordSupported(clusterInfo)
-	assert.False(t, value)
 }
